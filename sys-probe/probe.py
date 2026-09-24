@@ -169,6 +169,10 @@ def answer_commands(ctx):
         if chat != str(TG_CHAT) or not text.startswith("/"):
             continue
         cmd = text.split("@")[0]
+        for full in ("/status", "/latest", "/check", "/test", "/help"):
+            if full.startswith(cmd) and len(cmd) >= 4:
+                cmd = full
+                break
         if cmd == "/status":
             send(f"Probe OK. Tracking {ctx['tracked']} items. "
                  f"Last check: {ctx['checked_at']}. New this run: {ctx['new']}. "
