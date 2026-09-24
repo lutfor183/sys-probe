@@ -34,5 +34,5 @@ jobs:
           git add -f sys-probe/state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "probe state update"
           git fetch origin
-          git rebase origin/main || (git rebase --abort; git checkout origin/main -- sys-probe/state.json || true)
+          git rebase origin/main || (git rebase --abort; git reset --hard origin/main)
           git push
