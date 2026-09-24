@@ -31,6 +31,6 @@ jobs:
       - run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add sys-probe/state.json
+          git add sys-probe/state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "probe state update"
           git push
