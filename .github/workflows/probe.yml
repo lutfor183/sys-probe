@@ -1,0 +1,36 @@
+name: service probe
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [probe]
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send test message (true/false)"
+        required: false
+        default: "false"
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pycryptodome
+      - run: python3 sys-probe/probe.py
+        env:
+          PROBE_KEY: ${{ secrets.PROBE_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          PROBE_TEST: ${{ inputs.test == 'true' && '1' || '' }}
+      - run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add sys-probe/state.json
+          git diff --cached --quiet || git commit -m "probe state update"
+          git push
