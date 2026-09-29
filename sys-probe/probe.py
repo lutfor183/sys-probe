@@ -166,7 +166,7 @@ def answer_commands(ctx):
         m = u.get("message", {})
         chat = str(m.get("chat", {}).get("id", ""))
         text = (m.get("text") or "").strip().lower().split()[0] if (m.get("text") or "").strip() else ""
-        if chat != str(TG_CHAT) or not text.startswith("/"):
+        if not text.startswith("/"):
             continue
         cmd = text.split("@")[0]
         for full in ("/status", "/latest", "/check", "/test", "/help"):
