@@ -18,7 +18,16 @@ TEST = os.environ.get("PROBE_TEST") == "1"
 
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 HOT = []  # filled from encrypted blob at runtime
-HOT_EXTRA = ["finalresult", "final", "meritlist", "recommend"]
+# BCS-only monitor. norm() lowercases, converts BN digits ০-৯ -> 0-9, strips spaces/dots.
+# So matching is case-insensitive + BN/EN insensitive.
+HOT_EXTRA = [
+    "finalresult", "final", "result",
+    "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "চূড়ান্তফলাফল",
+    "merit", "meritlist", "মেধা",
+    "recommend", "সুপারিশ", "মনোনয়ন", "মনোনयन".replace("यन","য়ন"),
+    "viva", "মৌখিক",
+    "bcs", "বিসিএস",
+]
 
 
 def norm(s):
@@ -35,6 +44,14 @@ CFG = {}
 def hot_match(title):
     n = norm(title).lower()
     return any(k in n for k in HOT) or any(k in n for k in HOT_EXTRA)
+
+
+def is_50_final(title):
+    # Emergency: 50th BCS + result words, BN/EN insensitive
+    n = norm(title).lower()
+    has50 = "50" in n  # ৫০ already -> 50 via BN_DIGITS
+    result_words = ["final", "result", "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "merit", "সুপারিশ", "মনোনয়ন", "recommend"]
+    return has50 and any(k in n for k in result_words)
 
 
 def decrypt_targets():
@@ -718,16 +735,20 @@ def main():
         is_hot = hot_match(
             x["title"]
         )
+        is_emg = is_50_final(x["title"])
 
-        flag = (
-            "\n*** FINAL-RESULT keywords matched "
-            "- CHECK IMMEDIATELY ***"
-            if is_hot
-            else ""
-        )
+        if is_emg:
+            flag = "\n🚨🚨 EMERGENCY: 50th BCS FINAL RESULT - CHECK IMMEDIATELY 🚨🚨"
+            prefix = "🚨🚨 EMERGENCY 50 BCS RESULT 🚨🚨\n\n"
+        elif is_hot:
+            flag = "\n*** BCS keywords matched - CHECK ***"
+            prefix = "NEW BCS ITEM ALERT\n\n"
+        else:
+            flag = ""
+            prefix = "NEW BCS ITEM ALERT\n\n"
 
         msg = (
-            f"NEW ITEM ALERT{flag}\n\n"
+            f"{prefix.strip()}{flag}\n\n"
             f"Title: {x['title']}\n"
             f"Published: {x['date']}\n"
             f"Details: {x['link']}"
@@ -742,9 +763,9 @@ def main():
         if x["pdf"]:
 
             tag = (
-                "FINAL notice"
-                if is_hot
-                else "Notice"
+                "🚨 EMERGENCY 50 BCS FINAL notice"
+                if is_emg
+                else ("BCS Notice" if is_hot else "Notice")
             )
 
             if send_doc(
