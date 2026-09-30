@@ -118,6 +118,12 @@ def parse(page):
             re.S
         )
 
+        e = re.search(
+            r'data-column="exam_type">.*?<span>(.*?)</span>',
+            row,
+            re.S
+        )
+
         v = re.search(
             r'<a href="(' +
             re.escape(CFG.get("pat", "/")) +
@@ -127,6 +133,15 @@ def parse(page):
 
         if not (t and v):
             continue
+
+        exam_type = re.sub(
+            r"\s+",
+            " ",
+            H.unescape(
+                re.sub(r"<[^>]+>", "", e.group(1))
+                if e else ""
+            )
+        ).strip()
 
         title = re.sub(
             r"\s+",
@@ -153,15 +168,33 @@ def parse(page):
             ),
 
             "link": CFG["base"] + v.group(1),
+
+            "exam_type": exam_type,
         })
 
     return out
 
 
-# IMPORTANT:
-# chat_id=None means automatic alerts go to TG_CHAT.
-# When a user sends a command, answer_commands()
-# passes that user's chat ID so the reply goes back to them.
+def is_bcs(x_or_title):
+    # ID-proof: does NOT rely on exam_type=...c1ba URL param.
+    # Uses exam_type column text + title keywords, BN/EN + case insensitive.
+    if isinstance(x_or_title, dict):
+        t = x_or_title.get("title", "")
+        e = x_or_title.get("exam_type", "")
+        n = norm(t + " " + e).lower()
+        if "বিসিএস" in (t + " " + e):
+            return True
+        return "bcs" in n
+    n = norm(x_or_title).lower()
+    if "বিসিএস" in x_or_title:
+        return True
+    return "bcs" in n
+
+
+# Broadcast model:
+# - TG_CHAT is the owner channel (always notified).
+# - ST["_subs"] is auto-built list of every chat that ever messaged the bot.
+# - Passive BCS alerts go to owner + all subs. Active /all /bcs replies go to sender.
 def send(text, chat_id=None):
     destination = chat_id or TG_CHAT
 
@@ -187,6 +220,35 @@ def send(text, chat_id=None):
 
     with urllib.request.urlopen(req, timeout=20) as r:
         return r.status == 200
+
+
+def subs():
+    s = set(ST.get("_subs", []))
+    if TG_CHAT:
+        s.add(str(TG_CHAT))
+    return sorted(s)
+
+
+def add_sub(chat_id):
+    if not chat_id:
+        return
+    c = str(chat_id)
+    cur = set(str(x) for x in ST.get("_subs", []))
+    if c not in cur:
+        cur.add(c)
+        ST["_subs"] = sorted(cur)
+
+
+def broadcast(text):
+    ok = False
+    for dest in subs():
+        try:
+            if send(text, dest):
+                ok = True
+        except Exception as e:
+            print(f"broadcast to {dest} failed: {str(e)[:60]}")
+    # fallback: if no subs yet, send() already covers TG_CHAT via subs()
+    return ok
 
 
 def relevant(title):
@@ -244,9 +306,10 @@ def fetch_bytes(url):
         return r.read()
 
 
-def send_doc(url, caption):
-    # Automatic PDF alerts remain restricted to TG_CHAT.
-    if not (TG_TOKEN and TG_CHAT):
+def send_doc(url, caption, chat_id=None):
+    # PDF broadcast: if chat_id given send there, else to all subs
+    targets = [str(chat_id)] if chat_id else subs()
+    if not (TG_TOKEN and targets):
         if os.environ.get("PROBE_VERBOSE") == "1":
             print("[DRY-RUN] would attach: " + url[:80])
         else:
@@ -259,38 +322,46 @@ def send_doc(url, caption):
         if len(blob) > 45 * 1024 * 1024 or len(blob) < 1000:
             return False
 
-        bnd = "----probe" + os.urandom(8).hex()
-        cap = caption[:900]
+        ok_any = False
+        for dest in targets:
+            try:
+                bnd = "----probe" + os.urandom(8).hex()
+                cap = caption[:900]
 
-        body = (
-            f"--{bnd}\r\n"
-            f"Content-Disposition: form-data; "
-            f"name=\"chat_id\"\r\n\r\n"
-            f"{TG_CHAT}\r\n"
+                body = (
+                    f"--{bnd}\r\n"
+                    f"Content-Disposition: form-data; "
+                    f"name=\"chat_id\"\r\n\r\n"
+                    f"{dest}\r\n"
 
-            f"--{bnd}\r\n"
-            f"Content-Disposition: form-data; "
-            f"name=\"caption\"\r\n\r\n"
-            f"{cap}\r\n"
+                    f"--{bnd}\r\n"
+                    f"Content-Disposition: form-data; "
+                    f"name=\"caption\"\r\n\r\n"
+                    f"{cap}\r\n"
 
-            f"--{bnd}\r\n"
-            f"Content-Disposition: form-data; "
-            f"name=\"document\"; "
-            f"filename=\"notice.pdf\"\r\n"
-            f"Content-Type: application/pdf\r\n\r\n"
-        ).encode() + blob + f"\r\n--{bnd}--\r\n".encode()
+                    f"--{bnd}\r\n"
+                    f"Content-Disposition: form-data; "
+                    f"name=\"document\"; "
+                    f"filename=\"notice.pdf\"\r\n"
+                    f"Content-Type: application/pdf\r\n\r\n"
+                ).encode() + blob + f"\r\n--{bnd}--\r\n".encode()
 
-        req2 = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-            data=body,
-            headers={
-                "Content-Type":
-                    f"multipart/form-data; boundary={bnd}"
-            }
-        )
+                req2 = urllib.request.Request(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                    data=body,
+                    headers={
+                        "Content-Type":
+                            f"multipart/form-data; boundary={bnd}"
+                    },
+                )
 
-        with urllib.request.urlopen(req2, timeout=120) as r2:
-            return r2.status == 200
+                with urllib.request.urlopen(req2, timeout=120) as r2:
+                    if r2.status == 200:
+                        ok_any = True
+            except Exception as e:
+                print(f"attach to {dest} failed:", str(e)[:80])
+                continue
+        return ok_any
 
     except Exception as e:
         print(
@@ -343,10 +414,7 @@ def load_updates():
 def answer_commands(ctx):
     global ST
 
-    # TG_CHAT is still required because it is the
-    # destination for automatic monitoring alerts.
-    # It does NOT restrict who can use commands.
-    if not (TG_TOKEN and TG_CHAT):
+    if not TG_TOKEN:
         return
 
     for u in load_updates():
@@ -355,62 +423,63 @@ def answer_commands(ctx):
 
         m = u.get("message", {})
 
-        # The chat ID of whoever sent the command.
         chat = str(
             m.get("chat", {}).get("id", "")
         )
-
-        raw_text = m.get("text") or ""
-
-        text = (
-            raw_text.strip().lower().split()[0]
-            if raw_text.strip()
-            else ""
-        )
-
-        # Anyone can issue commands.
-        if not text.startswith("/"):
+        if not chat:
             continue
 
-        cmd = text.split("@")[0]
+        # broadcast: anyone who talks to bot gets future passive alerts
+        add_sub(chat)
+
+        raw_text = (m.get("text") or "").strip()
+        if not raw_text:
+            continue
+        # auto-subscribe even on plain hi, reply once
+        if not raw_text.startswith("/"):
+            send(
+                "Subscribed to BCS alerts. Commands: /bcs /all /latest /status /check /test",
+                chat,
+            )
+            continue
+
+        cmd = raw_text.strip().lower().split()[0].split("@")[0]
 
         for full in (
+            "/start",
             "/status",
             "/latest",
+            "/bcs",
+            "/all",
             "/check",
             "/test",
-            "/help"
+            "/help",
         ):
-            if full.startswith(cmd) and len(cmd) >= 4:
+            if full.startswith(cmd) and len(cmd) >= 3:
                 cmd = full
                 break
 
-        # IMPORTANT:
-        # Every command response uses `chat`.
-        # Therefore the response goes back to the
-        # person who issued the command.
-
-        if cmd == "/status":
-
+        if cmd == "/start":
             send(
-                f"Probe OK. Tracking {ctx['tracked']} items. "
-                f"Last check: {ctx['checked_at']}. "
-                f"New this run: {ctx['new']}. "
-                f"State: "
-                f"{'BLIND' if ctx['blind'] else 'watching'}.",
-                chat
+                "Subscribed to BCS alerts.\nCommands:\n/bcs - latest BCS\n/all - latest ALL PSC\n/latest - latest BCS\n/status /check /test",
+                chat,
             )
 
-        elif cmd == "/latest":
+        elif cmd == "/status":
+            send(
+                f"Probe OK. Tracking {ctx['tracked']} BCS items. "
+                f"Last check: {ctx['checked_at']}. "
+                f"New this run: {ctx['new']}. "
+                f"Subs: {len(subs())}. "
+                f"State: "
+                f"{'BLIND' if ctx['blind'] else 'watching'}.",
+                chat,
+            )
 
-            top = ctx.get("top", [])[:5]
-
+        elif cmd in ("/bcs", "/latest"):
+            top = ctx.get("top_bcs", ctx.get("top", []))[:5]
             if not top:
-                send(
-                    "No items cached yet.",
-                    chat
-                )
-
+                send("No BCS items cached yet.", chat)
             else:
                 lines = [
                     f"{i+1}. "
@@ -418,36 +487,35 @@ def answer_commands(ctx):
                     f"({x['date']})"
                     for i, x in enumerate(top)
                 ]
+                send("Latest BCS:\n\n" + "\n\n".join(lines), chat)
 
-                send(
-                    "Latest tracked items:\n\n"
-                    + "\n\n".join(lines),
-                    chat
-                )
+        elif cmd == "/all":
+            top = ctx.get("top_all", [])[:5]
+            if not top:
+                send("No items cached yet.", chat)
+            else:
+                lines = [
+                    f"{i+1}. "
+                    f"{x['title'][:120]} "
+                    f"({x['date']})"
+                    for i, x in enumerate(top)
+                ]
+                send("Latest ALL PSC:\n\n" + "\n\n".join(lines), chat)
 
         elif cmd == "/check":
-
             send(
                 f"Checked just now "
                 f"({ctx['checked_at']}). "
-                f"New this run: {ctx['new']}. "
+                f"New BCS this run: {ctx['new']}. "
                 f"{'All quiet.' if not ctx['new'] else 'Alerts sent above.'}",
-                chat
+                chat,
             )
 
         elif cmd == "/test":
-
-            send(
-                "Probe test: channel live.",
-                chat
-            )
+            send("Probe test: channel live.", chat)
 
         else:
-
-            send(
-                "Commands: /status /latest /check /test",
-                chat
-            )
+            send("Commands: /bcs /all /latest /status /check /test", chat)
 
 
 def run_url():
@@ -480,7 +548,7 @@ def main():
 
     if TEST:
 
-        ok = send(
+        ok = broadcast(
             "Probe test: monitoring channel is live. "
             "You will get an alert here on any new item "
             "or any failure."
@@ -526,15 +594,28 @@ def main():
 
         sys.exit(1)
 
-    items, errors = [], []
+    items_all, errors = [], []
 
     for u in urls:
 
         try:
-            items += parse(get(u))
+            items_all += parse(get(u))
 
         except Exception as e:
             errors.append(f"{e}")
+
+    # dedupe by hash, keep first
+    seen_h = set()
+    dedup_all = []
+    for x in items_all:
+        if x["h"] not in seen_h:
+            seen_h.add(x["h"])
+            dedup_all.append(x)
+    items_all = dedup_all
+
+    # ID-proof BCS filter: exam_type column OR title keywords.
+    # Even if exam_type=...c1ba ID changes, BCS still caught from /all page.
+    items = [x for x in items_all if is_bcs(x)]
 
     hot_items = []
 
@@ -550,6 +631,8 @@ def main():
 
         except Exception as e:
             errors.append(f"extra: {e}")
+    # also include BCS matches from hot urls even if ID changed
+    hot_items = [x for x in hot_items if is_bcs(x)] if hot_items else []
 
     ctx = {
         "tracked": 0,
@@ -565,7 +648,7 @@ def main():
         "top": []
     }
 
-    if not items:
+    if not items_all:
 
         # Total blind: both sources failed.
         st = {}
@@ -592,10 +675,10 @@ def main():
                 open(STATE, "w")
             )
 
-            send(
+            broadcast(
                 f"PROBE FAILURE: all sources unreachable "
                 f"({'; '.join(errors)[:200]}). "
-                f"You are currently BLIND - retrying every 5 min. "
+                f"You are currently BLIND - retrying every 2 min. "
                 f"Logs: {run_url()}"
             )
 
@@ -685,10 +768,10 @@ def main():
 
     if first:
 
-        send(
+        broadcast(
             f"Probe started. Tracking "
-            f"{len(items)} existing items. "
-            f"Alerts will arrive here on any new item."
+            f"{len(items)} BCS items ({len(items_all)} total). "
+            f"Alerts will arrive here on any new BCS item."
         )
 
         ST.update(st)
@@ -704,28 +787,32 @@ def main():
 
     if was_failing:
 
-        send(
+        broadcast(
             "Probe recovered: sources reachable again."
         )
 
+    top_bcs_sorted = sorted(
+        items,
+        key=lambda z: z.get("date", ""),
+        reverse=True,
+    )
+    top_all_sorted = sorted(
+        items_all,
+        key=lambda z: z.get("date", ""),
+        reverse=True,
+    )
     ctx.update({
-        "tracked":
-            len([
-                k for k in st
-                if not k.startswith("_")
-            ]),
+        "tracked": len([k for k in st if not k.startswith("_")]),
 
         "new": len(uniq),
 
         "blind": False,
 
-        "top":
-            sorted(
-                items,
-                key=lambda z:
-                    z.get("date", ""),
-                reverse=True
-            )
+        "top": top_bcs_sorted,
+
+        "top_bcs": top_bcs_sorted,
+
+        "top_all": top_all_sorted,
     })
 
     ST = st
@@ -757,8 +844,8 @@ def main():
         if x["pdf"]:
             msg += f"\nPDF: {x['pdf']}"
 
-        # Automatic alert → TG_CHAT
-        send(msg)
+        # Passive BCS alert → owner + all subs
+        broadcast(msg)
 
         if x["pdf"]:
 
