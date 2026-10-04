@@ -46,6 +46,16 @@ def hot_match(title):
     return any(k in n for k in HOT) or any(k in n for k in HOT_EXTRA)
 
 
+def datekey(x):
+    # DD-MM-YYYY (BN digits already -> EN) as (YYYY,MM,DD).
+    # Plain string sort puts 30-07 above 01-10 and hides the newest items.
+    try:
+        d, m, y = x.get("date", "").strip().split("-")[:3]
+        return (int(y), int(m), int(d))
+    except Exception:
+        return (0, 0, 0)
+
+
 def is_50_final(title):
     # Emergency: 50th BCS + result words, BN/EN insensitive
     n = norm(title).lower()
@@ -476,8 +486,8 @@ def answer_commands(ctx):
                 chat,
             )
 
-        elif cmd in ("/bcs", "/latest"):
-            top = ctx.get("top_bcs", ctx.get("top", []))[:5]
+        elif cmd == "/bcs":
+            top = ctx.get("top_bcs", [])[:5]
             if not top:
                 send("No BCS items cached yet.", chat)
             else:
@@ -487,9 +497,9 @@ def answer_commands(ctx):
                     f"({x['date']})"
                     for i, x in enumerate(top)
                 ]
-                send("Latest BCS:\n\n" + "\n\n".join(lines), chat)
+                send("Latest BCS (top 5):\n\n" + "\n\n".join(lines), chat)
 
-        elif cmd == "/all":
+        elif cmd in ("/all", "/latest"):
             top = ctx.get("top_all", [])[:5]
             if not top:
                 send("No items cached yet.", chat)
@@ -500,7 +510,7 @@ def answer_commands(ctx):
                     f"({x['date']})"
                     for i, x in enumerate(top)
                 ]
-                send("Latest ALL PSC:\n\n" + "\n\n".join(lines), chat)
+                send("Latest ALL (top 5):\n\n" + "\n\n".join(lines), chat)
 
         elif cmd == "/check":
             send(
@@ -791,16 +801,8 @@ def main():
             "Probe recovered: sources reachable again."
         )
 
-    top_bcs_sorted = sorted(
-        items,
-        key=lambda z: z.get("date", ""),
-        reverse=True,
-    )
-    top_all_sorted = sorted(
-        items_all,
-        key=lambda z: z.get("date", ""),
-        reverse=True,
-    )
+    top_bcs_sorted = sorted(items, key=datekey, reverse=True)
+    top_all_sorted = sorted(items_all, key=datekey, reverse=True)
     ctx.update({
         "tracked": len([k for k in st if not k.startswith("_")]),
 
