@@ -30,6 +30,45 @@ HOT_EXTRA = [
 ]
 
 
+# Second-tier keywords: BCS-adjacent. Used only to avoid silent misses.
+# Anything matching these (but NOT is_bcs) gets a "POSSIBLE BCS - verify" alert.
+MAYBE_KEYS = [
+    "cadre", "ক্যাডার", "কাডার",
+    "bpsc", "psc", "পিএসসি",
+    "noncadre", "non-cadre",
+    "written", "লিখিত",
+    "preliminary", "প্রিলিমিনারি", "প্রিলি",
+    "mcq", "এমসিকিউ",
+    "admit", "প্রবেশপত্র",
+    "seat", "আসন", "কেন্দ্র", "center", "centre",
+    "routine", "রুটিন", "schedule", "সময়সূচি", "সূচি",
+    "syllabus", "সিলেবাস",
+    "circular", "বিজ্ঞপ্তি", "বিজ্ঞাপন",
+]
+
+
+def extract_sitestamp(page):
+    """Footer stamp e.g. 'সাইটটি শেষ হাল-নাগাদ করা হয়েছে: মঙ্গলবার, ৬ অক্টোবর, ২০২৬ এ ১৫:১৯:৫৪'.
+    Returns normalized display string (up to 200 chars) or '' if not found."""
+    if not page:
+        return ""
+    i = page.find("হাল-নাগাদ")
+    if i < 0:
+        i = page.find("হালনাগাদ")
+    if i < 0:
+        return ""
+    seg = page[max(0, i - 60):i + 220]
+    seg = re.sub(r"<[^>]+>", " ", seg)
+    seg = H.unescape(seg)
+    seg = re.sub(r"\s+", " ", seg).strip()
+    for _cut in ("সাইটটি", "সাইট", "শেষ"):
+        _j = seg.find(_cut)
+        if _j >= 0:
+            seg = seg[_j:]
+            break
+    return seg[:200]
+
+
 def norm(s):
     s = H.unescape(s or "")
     s = re.sub(r"<[^>]+>", "", s)
@@ -199,6 +238,31 @@ def is_bcs(x_or_title):
     if "বিসিএস" in x_or_title:
         return True
     return "bcs" in n
+
+
+def is_maybe_bcs(x_or_title):
+    """Second net: BCS-adjacent items that is_bcs() might miss.
+    Never fires for items already classified as BCS."""
+    if isinstance(x_or_title, dict):
+        t = x_or_title.get("title", "")
+        e = x_or_title.get("exam_type", "")
+        raw = (t or "") + " " + (e or "")
+    else:
+        raw = x_or_title or ""
+    if is_bcs(raw):
+        return False
+    n = norm(raw).lower()
+    if any(k in n for k in MAYBE_KEYS):
+        return True
+    # BCS-series numbers 43-55 + any result/exam word -> suspicious
+    if re.search(r"(4[3-9]|5[0-5])", n):
+        examish = ["result", "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "merit",
+                   "viva", "মৌখিক", "written", "লিখিত", "preli",
+                   "প্রিলি", "recommend", "সুপারিশ", "মনোনয়ন",
+                   "admit", "প্রবেশপত্র", "seat", "circular", "বিজ্ঞপ্তি"]
+        if any(k in n for k in examish):
+            return True
+    return False
 
 
 # Broadcast model:
@@ -476,13 +540,16 @@ def answer_commands(ctx):
             )
 
         elif cmd == "/status":
+            stamp = ctx.get("stamp", "")
             send(
                 f"Probe OK. Tracking {ctx['tracked']} BCS items. "
                 f"Last check: {ctx['checked_at']}. "
-                f"New this run: {ctx['new']}. "
+                f"New this run: {ctx['new']} "
+                f"(maybe={ctx.get('maybe', 0)} other={ctx.get('other', 0)}). "
                 f"Subs: {len(subs())}. "
                 f"State: "
-                f"{'BLIND' if ctx['blind'] else 'watching'}.",
+                f"{'BLIND' if ctx['blind'] else 'watching'}. "
+                f"Site stamp: {stamp or 'n/a'}.",
                 chat,
             )
 
@@ -605,11 +672,25 @@ def main():
         sys.exit(1)
 
     items_all, errors = [], []
+    stamps = []
+
+    # Homepage footer stamp (সাইটটি শেষ হাল-নাগাদ...) - cheapest change signal
+    try:
+        _home = get(CFG["base"])
+        _s = extract_sitestamp(_home)
+        if _s:
+            stamps.append(_s)
+    except Exception as e:
+        errors.append(f"home: {e}")
 
     for u in urls:
 
         try:
-            items_all += parse(get(u))
+            _page = get(u)
+            items_all += parse(_page)
+            _s = extract_sitestamp(_page)
+            if _s:
+                stamps.append(_s)
 
         except Exception as e:
             errors.append(f"{e}")
@@ -632,12 +713,15 @@ def main():
     for u in hurls:
 
         try:
-
+            _hpage = get(u)
             hot_items += [
                 x
-                for x in parse(get(u))
+                for x in parse(_hpage)
                 if relevant(x["title"])
             ]
+            _s = extract_sitestamp(_hpage)
+            if _s:
+                stamps.append(_s)
 
         except Exception as e:
             errors.append(f"extra: {e}")
@@ -688,7 +772,7 @@ def main():
             broadcast(
                 f"PROBE FAILURE: all sources unreachable "
                 f"({'; '.join(errors)[:200]}). "
-                f"You are currently BLIND - retrying every 2 min. "
+                f"You are currently BLIND - retrying every few min. "
                 f"Logs: {run_url()}"
             )
 
@@ -776,12 +860,41 @@ def main():
         if x not in uniq
     ]
 
-    if first:
+    # ---- site footer stamp: most common value seen this run ----
+    cur_stamp = ""
+    if stamps:
+        from collections import Counter
+        cur_stamp = Counter(stamps).most_common(1)[0][0]
+    old_stamp = st.get("_sitestamp", "")
+    stamp_changed = bool(cur_stamp and old_stamp and cur_stamp != old_stamp)
+    if cur_stamp:
+        st["_sitestamp"] = cur_stamp
 
+    # ---- anti-miss second net (computed from pre-run seen_ids) ----
+    maybe_new = [
+        x for x in items_all
+        if x["h"] not in seen_ids and not is_bcs(x) and is_maybe_bcs(x)
+    ]
+    # dedupe maybe by hash
+    _mh = set()
+    maybe_new = [x for x in maybe_new if x["h"] not in _mh and not _mh.add(x["h"])]
+    other_new = [
+        x for x in items_all
+        if x["h"] not in seen_ids and not is_bcs(x) and not is_maybe_bcs(x)
+    ]
+    _oh = set()
+    other_new = [x for x in other_new if x["h"] not in _oh and not _oh.add(x["h"])]
+    for x in maybe_new + other_new:
+        st[x["h"]] = x["date"]
+
+    print(f"stamp_changed={stamp_changed} maybe={len(maybe_new)} other={len(other_new)}")
+
+    if first:
+        _smsg = f" Site stamp: {cur_stamp}" if cur_stamp else ""
         broadcast(
             f"Probe started. Tracking "
             f"{len(items)} BCS items ({len(items_all)} total). "
-            f"Alerts will arrive here on any new BCS item."
+            f"Alerts will arrive here on any new BCS item.{_smsg}"
         )
 
         ST.update(st)
@@ -815,6 +928,14 @@ def main():
         "top_bcs": top_bcs_sorted,
 
         "top_all": top_all_sorted,
+
+        "stamp": cur_stamp,
+
+        "stamp_changed": stamp_changed,
+
+        "maybe": len(maybe_new),
+
+        "other": len(other_new),
     })
 
     ST = st
@@ -871,6 +992,33 @@ def main():
             "alerted:",
             x["h"]
         )
+
+    for x in maybe_new:
+        msg = (
+            "POSSIBLE BCS - VERIFY MANUALLY\n\n"
+            f"Title: {x['title']}\n"
+            f"Published: {x['date']}\n"
+            f"Details: {x['link']}"
+        )
+        if x["pdf"]:
+            msg += f"\nPDF: {x['pdf']}"
+        broadcast(msg)
+        print("maybe-alerted:", x["h"])
+
+    if stamp_changed:
+        lines = []
+        if other_new:
+            for i, x in enumerate(other_new[:5]):
+                lines.append(f"{i+1}. {x['title'][:110]} ({x['date']})")
+        extra = ""
+        if maybe_new or other_new:
+            extra = f" New non-BCS this run: maybe={len(maybe_new)} other={len(other_new)}."
+            if lines:
+                extra += "\n\nNew other items (check manually):\n" + "\n".join(lines)
+        broadcast(
+            f"SITE UPDATED (footer timestamp changed)\n\nOld: {old_stamp}\nNew: {cur_stamp}.{extra}\nChecked: {ctx['checked_at']}"
+        )
+        print("stamp-alerted")
 
     # Commands → whoever sent the command
     answer_commands(ctx)

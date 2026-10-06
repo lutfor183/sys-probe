@@ -1,7 +1,7 @@
 name: service probe
 on:
   schedule:
-    - cron: "*/2 * * * *"
+    - cron: "*/5 * * * *"
   repository_dispatch:
     types: [probe]
   workflow_dispatch:
@@ -15,14 +15,24 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install pycryptodome
-      - run: python3 sys-probe/probe.py
+      # 3 passes ~90s apart per run: effective ~90s granularity even though
+      # GitHub schedule fires every ~5-10 min (Actions minimum is 5 min,
+      # plus queue delay — */2 in cron does NOT actually run every 2 min).
+      - run: |
+          for i in 1 2 3; do
+            echo "=== pass $i ==="
+            python3 sys-probe/probe.py || true
+            if [ "$i" -lt 3 ] && [ "${{ inputs.test }}" != "true" ]; then
+              sleep 90
+            fi
+          done
         env:
           PROBE_KEY: ${{ secrets.PROBE_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
