@@ -30,20 +30,14 @@ HOT_EXTRA = [
 ]
 
 
-# Second-tier keywords: BCS-adjacent. Used only to avoid silent misses.
-# Anything matching these (but NOT is_bcs) gets a "POSSIBLE BCS - verify" alert.
-MAYBE_KEYS = [
+# Strict second net: NEVER sends standalone alerts (no false flags).
+# Only used as extra digest lines inside the footer-stamp-changed message.
+# Requires BOTH a BCS-series number (43-55) AND a commission/cadre word.
+MAYBE_NUM_RE = r"(4[3-9]|5[0-5])"
+MAYBE_AUTH_KEYS = [
     "cadre", "ক্যাডার", "কাডার",
     "bpsc", "psc", "পিএসসি",
-    "noncadre", "non-cadre",
-    "written", "লিখিত",
-    "preliminary", "প্রিলিমিনারি", "প্রিলি",
-    "mcq", "এমসিকিউ",
-    "admit", "প্রবেশপত্র",
-    "seat", "আসন", "কেন্দ্র", "center", "centre",
-    "routine", "রুটিন", "schedule", "সময়সূচি", "সূচি",
-    "syllabus", "সিলেবাস",
-    "circular", "বিজ্ঞপ্তি", "বিজ্ঞাপন",
+    "civilservice",
 ]
 
 
@@ -241,8 +235,8 @@ def is_bcs(x_or_title):
 
 
 def is_maybe_bcs(x_or_title):
-    """Second net: BCS-adjacent items that is_bcs() might miss.
-    Never fires for items already classified as BCS."""
+    """Strict second net: number 43-55 AND commission/cadre word, and NOT is_bcs().
+    Generic words (seat/routine/circular/...) deliberately excluded to avoid spam."""
     if isinstance(x_or_title, dict):
         t = x_or_title.get("title", "")
         e = x_or_title.get("exam_type", "")
@@ -252,17 +246,9 @@ def is_maybe_bcs(x_or_title):
     if is_bcs(raw):
         return False
     n = norm(raw).lower()
-    if any(k in n for k in MAYBE_KEYS):
-        return True
-    # BCS-series numbers 43-55 + any result/exam word -> suspicious
-    if re.search(r"(4[3-9]|5[0-5])", n):
-        examish = ["result", "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "merit",
-                   "viva", "মৌখিক", "written", "লিখিত", "preli",
-                   "প্রিলি", "recommend", "সুপারিশ", "মনোনয়ন",
-                   "admit", "প্রবেশপত্র", "seat", "circular", "বিজ্ঞপ্তি"]
-        if any(k in n for k in examish):
-            return True
-    return False
+    if not re.search(MAYBE_NUM_RE, n):
+        return False
+    return any(k in n for k in MAYBE_AUTH_KEYS)
 
 
 # Broadcast model:
@@ -993,19 +979,14 @@ def main():
             x["h"]
         )
 
-    for x in maybe_new:
-        msg = (
-            "POSSIBLE BCS - VERIFY MANUALLY\n\n"
-            f"Title: {x['title']}\n"
-            f"Published: {x['date']}\n"
-            f"Details: {x['link']}"
-        )
-        if x["pdf"]:
-            msg += f"\nPDF: {x['pdf']}"
-        broadcast(msg)
-        print("maybe-alerted:", x["h"])
+    # Baseline once: historic non-BCS hashes were never stored before this
+    # feature, so the very first run after deploy must NOT alert on them.
+    sig_init = st.get("_sig_init", False)
+    if not sig_init:
+        st["_sig_init"] = True
+        print(f"signal baseline stored (maybe={len(maybe_new)} other={len(other_new)}), no digest sent")
 
-    if stamp_changed:
+    if stamp_changed and sig_init:
         lines = []
         if other_new:
             for i, x in enumerate(other_new[:5]):
