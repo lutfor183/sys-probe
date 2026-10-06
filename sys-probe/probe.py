@@ -660,24 +660,46 @@ def main():
     items_all, errors = [], []
     stamps = []
 
-    # Homepage footer stamp (সাইটটি শেষ হাল-নাগাদ...) - cheapest change signal
+    # Parallel fetch (stdlib threads): cuts per-pass time from serial
+    # sum(urls) to roughly max(urls). Same parsing/stamp logic as before.
+    def _fetch(u):
+        try:
+            return (u, get(u), "")
+        except Exception as e:
+            return (u, "", f"{e}"[:120])
+
+    _all_urls = [CFG["base"]] + list(urls)
+    _pages = {}
     try:
-        _home = get(CFG["base"])
-        _s = extract_sitestamp(_home)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as _ex:
+            for _u, _body, _err in _ex.map(_fetch, _all_urls):
+                if _err:
+                    errors.append(f"{_u[-40:]}: {_err}" if _u != CFG["base"] else f"home: {_err}")
+                elif _body:
+                    _pages[_u] = _body
+    except Exception:
+        _pages = {}
+        for _u in _all_urls:
+            try:
+                _pages[_u] = get(_u)
+            except Exception as e:
+                errors.append(f"home: {e}" if _u == CFG["base"] else f"{e}")
+
+    if CFG["base"] in _pages:
+        _s = extract_sitestamp(_pages[CFG["base"]])
         if _s:
             stamps.append(_s)
-    except Exception as e:
-        errors.append(f"home: {e}")
 
     for u in urls:
-
+        _page = _pages.get(u, "")
+        if not _page:
+            continue
         try:
-            _page = get(u)
             items_all += parse(_page)
             _s = extract_sitestamp(_page)
             if _s:
                 stamps.append(_s)
-
         except Exception as e:
             errors.append(f"{e}")
 
@@ -696,21 +718,33 @@ def main():
 
     hot_items = []
 
-    for u in hurls:
-
+    if hurls:
+        def _fetch_hot(u):
+            try:
+                return (u, get(u), "")
+            except Exception as e:
+                return (u, "", f"{e}"[:120])
         try:
-            _hpage = get(u)
-            hot_items += [
-                x
-                for x in parse(_hpage)
-                if relevant(x["title"])
-            ]
-            _s = extract_sitestamp(_hpage)
-            if _s:
-                stamps.append(_s)
-
-        except Exception as e:
-            errors.append(f"extra: {e}")
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as _hex:
+                _hot_pages = list(_hex.map(_fetch_hot, hurls))
+        except Exception:
+            _hot_pages = [_fetch_hot(u) for u in hurls]
+        for _u, _hpage, _herr in _hot_pages:
+            if _herr:
+                errors.append(f"extra: {_herr}")
+                continue
+            try:
+                hot_items += [
+                    x
+                    for x in parse(_hpage)
+                    if relevant(x["title"])
+                ]
+                _s = extract_sitestamp(_hpage)
+                if _s:
+                    stamps.append(_s)
+            except Exception as e:
+                errors.append(f"extra: {e}")
     # also include BCS matches from hot urls even if ID changed
     hot_items = [x for x in hot_items if is_bcs(x)] if hot_items else []
 
