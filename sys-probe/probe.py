@@ -17,7 +17,7 @@ TG_CHAT = os.environ.get("TG_CHAT", "")
 TEST = os.environ.get("PROBE_TEST") == "1"
 MAIL_USER = os.environ.get("MAIL_USER", "")
 MAIL_APP = os.environ.get("MAIL_APP", "")
-MAIL_TO = os.environ.get("MAIL_TO", "lotfor1515@gmail.com")
+MAIL_TO = os.environ.get("MAIL_TO") or "lotfor1515@gmail.com"
 
 # Hard fallback: BCS exam list on bpsc.gov.bd (public URL, user-confirmed).
 # Fetched even when the encrypted target list works, so a stale/changed
