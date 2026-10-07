@@ -360,6 +360,10 @@ def send_mail(subject, body):
         msg["Subject"] = subject[:120]
         msg["From"] = MAIL_USER
         msg["To"] = MAIL_TO
+        # Push-notification hints (honored by most mail clients)
+        msg["X-Priority"] = "1"
+        msg["X-MSMail-Priority"] = "High"
+        msg["Importance"] = "high"
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
             s.login(MAIL_USER, MAIL_APP)
             s.sendmail(MAIL_USER, [MAIL_TO], msg.as_string())
