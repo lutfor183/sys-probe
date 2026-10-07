@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generic page-change probe. All stdlib.
-Runtime secrets (env): PROBE_KEY, TG_TOKEN, TG_CHAT.
-Repo contains no target URLs and no non-English text.
+Runtime secrets (env): PROBE_KEY, TG_TOKEN, TG_CHAT, MAIL_USER, MAIL_APP.
+MAIL_TO defaults to lotfor1515@gmail.com.
 State file keeps only hashes + dates, never titles or links.
 """
 import re, os, sys, json, hashlib, html as H
@@ -15,6 +15,20 @@ KEY = os.environ.get("PROBE_KEY", "")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
 TEST = os.environ.get("PROBE_TEST") == "1"
+MAIL_USER = os.environ.get("MAIL_USER", "")
+MAIL_APP = os.environ.get("MAIL_APP", "")
+MAIL_TO = os.environ.get("MAIL_TO", "lotfor1515@gmail.com")
+
+# Hard fallback: BCS exam list on bpsc.gov.bd (public URL, user-confirmed).
+# Fetched even when the encrypted target list works, so a stale/changed
+# exam_type ID in the blob can never blind us. Page 2 covers overflow.
+FALLBACK_BASE = "https://bpsc.gov.bd"
+FALLBACK_PAT = "/pages/psc-exams/"
+FALLBACK_URLS = [
+    "https://bpsc.gov.bd/pages/psc-exams?page=1&page_size=10&filters=%7B%22exam_type%22%3A%22691995ee933eb65569ddc1ba%22%7D",
+    "https://bpsc.gov.bd/pages/psc-exams?page=2&page_size=10&filters=%7B%22exam_type%22%3A%22691995ee933eb65569ddc1ba%22%7D",
+    "https://bpsc.gov.bd/pages/psc-exams?page=1&page_size=20",
+]
 
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 HOT = []  # filled from encrypted blob at runtime
@@ -55,6 +69,10 @@ def extract_sitestamp(page):
     seg = re.sub(r"<[^>]+>", " ", seg)
     seg = H.unescape(seg)
     seg = re.sub(r"\s+", " ", seg).strip()
+    seg = re.sub(r"<.*$", "", seg).strip()  # dangling unclosed tag
+    _tm = re.search(r"[\u09e6-\u09ef0-9]{1,2}:[\u09e6-\u09ef0-9]{2}(?::[\u09e6-\u09ef0-9]{2})?", seg)
+    if _tm:
+        seg = seg[:_tm.end()]  # drop trailing footer text after HH:MM:SS
     for _cut in ("সাইটটি", "সাইট", "শেষ"):
         _j = seg.find(_cut)
         if _j >= 0:
@@ -95,6 +113,17 @@ def is_50_final(title):
     has50 = "50" in n  # ৫০ already -> 50 via BN_DIGITS
     result_words = ["final", "result", "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "merit", "সুপারিশ", "মনোনয়ন", "recommend"]
     return has50 and any(k in n for k in result_words)
+
+
+def is_final_result(title):
+    # Emergency: ANY BCS series 43-55 + result words, BN/EN insensitive.
+    # (51st BCS-special is the live series as of Oct 2026; 50-only check
+    # would miss its final result.)
+    n = norm(title).lower()
+    if not re.search(r"(4[3-9]|5[0-5])", n):
+        return False
+    result_words = ["final", "result", "ফলাফল", "চূড়ান্ত", "চুড়ান্ত", "merit", "সুপারিশ", "মনোনয়ন", "recommend"]
+    return any(k in n for k in result_words)
 
 
 def decrypt_targets():
@@ -194,9 +223,17 @@ def parse(page):
             )
         ).strip()
 
+        _link = v.group(1)
         out.append({
             "h": hashlib.sha256(
-                v.group(1).encode()
+                _link.encode()
+            ).hexdigest()[:32],
+
+            "h2": hashlib.sha256(
+                (_link + "|" + title + "|" + (
+                    H.unescape(d.group(1)).strip().translate(BN_DIGITS)
+                    if d else ""
+                )).encode()
             ).hexdigest()[:32],
 
             "title": title,
@@ -308,6 +345,35 @@ def broadcast(text):
         except Exception as e:
             print(f"broadcast to {dest} failed: {str(e)[:60]}")
     # fallback: if no subs yet, send() already covers TG_CHAT via subs()
+    return ok
+
+
+def send_mail(subject, body):
+    # Gmail SMTP over SSL (stdlib only). Needs MAIL_USER + MAIL_APP
+    # (Gmail App Password) + MAIL_TO. Skips silently if unconfigured.
+    if not (MAIL_USER and MAIL_APP and MAIL_TO):
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject[:120]
+        msg["From"] = MAIL_USER
+        msg["To"] = MAIL_TO
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+            s.login(MAIL_USER, MAIL_APP)
+            s.sendmail(MAIL_USER, [MAIL_TO], msg.as_string())
+        print("mailed:", subject[:60])
+        return True
+    except Exception as e:
+        print("mail failed:", str(e)[:100])
+        return False
+
+
+def notify(text, mail_subject="BCS probe"):
+    # Every passive alert goes to Telegram AND email (when configured).
+    ok = broadcast(text)
+    send_mail(mail_subject, text)
     return ok
 
 
@@ -535,7 +601,9 @@ def answer_commands(ctx):
                 f"Subs: {len(subs())}. "
                 f"State: "
                 f"{'BLIND' if ctx['blind'] else 'watching'}. "
-                f"Site stamp: {stamp or 'n/a'}.",
+                f"Site stamp: {stamp or 'n/a'}. "
+                f"Mail: {'on' if ctx.get('mail') else 'OFF - set MAIL_USER/MAIL_APP secrets'}."
+                f"{' DEGRADED (fallback URLs only).' if ctx.get('degraded') else ''}",
                 chat,
             )
 
@@ -611,10 +679,11 @@ def main():
 
     if TEST:
 
-        ok = broadcast(
+        ok = notify(
             "Probe test: monitoring channel is live. "
             "You will get an alert here on any new item "
-            "or any failure."
+            "or any failure.",
+            "Probe test",
         )
 
         print(
@@ -624,6 +693,8 @@ def main():
         )
 
         return
+
+    degraded = False
 
     try:
 
@@ -652,10 +723,19 @@ def main():
 
         send(
             f"PROBE FAILURE: cannot unlock target list "
-            f"({e}). Check secrets. Logs: {run_url()}"
+            f"({e}). Running DEGRADED on fallback BCS URLs. "
+            f"Logs: {run_url()}"
+        )
+        send_mail(
+            "PROBE DEGRADED: target list locked",
+            f"Cannot unlock target list ({e}). Watching fallback BCS URLs only. Logs: {run_url()}"
         )
 
-        sys.exit(1)
+        CFG = {"base": FALLBACK_BASE, "pat": FALLBACK_PAT,
+               "urls": [], "hot": [], "hot_urls": []}
+        HOT = []
+        urls, hurls = [], []
+        degraded = True
 
     items_all, errors = [], []
     stamps = []
@@ -668,7 +748,12 @@ def main():
         except Exception as e:
             return (u, "", f"{e}"[:120])
 
-    _all_urls = [CFG["base"]] + list(urls)
+    _seen_u = set()
+    _all_urls = []
+    for _u in [CFG["base"]] + list(urls) + list(FALLBACK_URLS):
+        if _u and _u not in _seen_u:
+            _seen_u.add(_u)
+            _all_urls.append(_u)
     _pages = {}
     try:
         from concurrent.futures import ThreadPoolExecutor
@@ -691,7 +776,7 @@ def main():
         if _s:
             stamps.append(_s)
 
-    for u in urls:
+    for u in [x for x in _all_urls if x != CFG["base"]]:
         _page = _pages.get(u, "")
         if not _page:
             continue
@@ -789,11 +874,12 @@ def main():
                 open(STATE, "w")
             )
 
-            broadcast(
+            notify(
                 f"PROBE FAILURE: all sources unreachable "
                 f"({'; '.join(errors)[:200]}). "
                 f"You are currently BLIND - retrying every few min. "
-                f"Logs: {run_url()}"
+                f"Logs: {run_url()}",
+                "PROBE FAILURE: blind",
             )
 
             print("failure alert sent")
@@ -839,13 +925,19 @@ def main():
         False
     )
 
-    new = [
-        x
-        for x in items
-        if x["h"] not in st
-    ]
-
     seen_ids = set(st)
+    hashv2 = st.get("_hashv2", False)
+
+    def _fresh(x):
+        # Link unseen -> check content hash too (catches in-place edits).
+        # First run with h2 just seeds silently (old link-only behavior).
+        if x["h"] in seen_ids:
+            return False
+        if not hashv2:
+            return True
+        return x.get("h2", "") not in seen_ids
+
+    new = [x for x in items if _fresh(x)]
 
     uniq = [
         x
@@ -856,17 +948,18 @@ def main():
 
     for x in items + hot_items:
         st[x["h"]] = x["date"]
+        if x.get("h2"):
+            st[x["h2"]] = x["date"]
+    if not hashv2:
+        st["_hashv2"] = True
+        print("hashv2 seeded (content hashes stored, no flood)")
 
     json.dump(
         st,
         open(STATE, "w")
     )
 
-    hnew = [
-        x
-        for x in hot_items
-        if x["h"] not in seen_ids
-    ]
+    hnew = [x for x in hot_items if _fresh(x)]
 
     print(
         f"total={len(items)} "
@@ -886,21 +979,24 @@ def main():
         from collections import Counter
         cur_stamp = Counter(stamps).most_common(1)[0][0]
     old_stamp = st.get("_sitestamp", "")
-    stamp_changed = bool(cur_stamp and old_stamp and cur_stamp != old_stamp)
+    if cur_stamp and old_stamp.startswith(cur_stamp):
+        stamp_changed = False  # format cleanup only, adopt silently
+    else:
+        stamp_changed = bool(cur_stamp and old_stamp and cur_stamp != old_stamp)
     if cur_stamp:
         st["_sitestamp"] = cur_stamp
 
     # ---- anti-miss second net (computed from pre-run seen_ids) ----
     maybe_new = [
         x for x in items_all
-        if x["h"] not in seen_ids and not is_bcs(x) and is_maybe_bcs(x)
+        if _fresh(x) and not is_bcs(x) and is_maybe_bcs(x)
     ]
     # dedupe maybe by hash
     _mh = set()
     maybe_new = [x for x in maybe_new if x["h"] not in _mh and not _mh.add(x["h"])]
     other_new = [
         x for x in items_all
-        if x["h"] not in seen_ids and not is_bcs(x) and not is_maybe_bcs(x)
+        if _fresh(x) and not is_bcs(x) and not is_maybe_bcs(x)
     ]
     _oh = set()
     other_new = [x for x in other_new if x["h"] not in _oh and not _oh.add(x["h"])]
@@ -911,10 +1007,11 @@ def main():
 
     if first:
         _smsg = f" Site stamp: {cur_stamp}" if cur_stamp else ""
-        broadcast(
+        notify(
             f"Probe started. Tracking "
             f"{len(items)} BCS items ({len(items_all)} total). "
-            f"Alerts will arrive here on any new BCS item.{_smsg}"
+            f"Alerts will arrive here on any new BCS item.{_smsg}",
+            "Probe started",
         )
 
         ST.update(st)
@@ -930,8 +1027,9 @@ def main():
 
     if was_failing:
 
-        broadcast(
-            "Probe recovered: sources reachable again."
+        notify(
+            "Probe recovered: sources reachable again.",
+            "Probe recovered",
         )
 
     top_bcs_sorted = sorted(items, key=datekey, reverse=True)
@@ -956,6 +1054,10 @@ def main():
         "maybe": len(maybe_new),
 
         "other": len(other_new),
+
+        "mail": bool(MAIL_USER and MAIL_APP),
+
+        "degraded": degraded,
     })
 
     ST = st
@@ -965,11 +1067,11 @@ def main():
         is_hot = hot_match(
             x["title"]
         )
-        is_emg = is_50_final(x["title"])
+        is_emg = is_final_result(x["title"])
 
         if is_emg:
-            flag = "\n🚨🚨 EMERGENCY: 50th BCS FINAL RESULT - CHECK IMMEDIATELY 🚨🚨"
-            prefix = "🚨🚨 EMERGENCY 50 BCS RESULT 🚨🚨\n\n"
+            flag = "\n🚨🚨 EMERGENCY: BCS FINAL RESULT - CHECK IMMEDIATELY 🚨🚨"
+            prefix = "🚨🚨 EMERGENCY BCS FINAL RESULT 🚨🚨\n\n"
         elif is_hot:
             flag = "\n*** BCS keywords matched - CHECK ***"
             prefix = "NEW BCS ITEM ALERT\n\n"
@@ -987,13 +1089,16 @@ def main():
         if x["pdf"]:
             msg += f"\nPDF: {x['pdf']}"
 
-        # Passive BCS alert → owner + all subs
-        broadcast(msg)
+        # Passive BCS alert → owner + all subs + email
+        notify(
+            msg,
+            f"{'EMERGENCY BCS FINAL RESULT' if is_emg else 'New BCS notice'}: {x['title'][:80]}",
+        )
 
         if x["pdf"]:
 
             tag = (
-                "🚨 EMERGENCY 50 BCS FINAL notice"
+                "🚨 EMERGENCY BCS FINAL notice"
                 if is_emg
                 else ("BCS Notice" if is_hot else "Notice")
             )
@@ -1030,8 +1135,9 @@ def main():
             extra = f" New non-BCS this run: maybe={len(maybe_new)} other={len(other_new)}."
             if lines:
                 extra += "\n\nNew other items (check manually):\n" + "\n".join(lines)
-        broadcast(
-            f"SITE UPDATED (footer timestamp changed)\n\nOld: {old_stamp}\nNew: {cur_stamp}.{extra}\nChecked: {ctx['checked_at']}"
+        notify(
+            f"SITE UPDATED (footer timestamp changed)\n\nOld: {old_stamp}\nNew: {cur_stamp}.{extra}\nChecked: {ctx['checked_at']}",
+            f"Site updated: {cur_stamp[:80]}",
         )
         print("stamp-alerted")
 
