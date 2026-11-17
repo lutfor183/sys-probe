@@ -32,6 +32,13 @@ jobs:
           TG_CHAT: ${{ secrets.TG_CHAT }}
           EPAPER_RETRIES: "6"
 
+      - name: register bot command menu
+        if: always()
+        run: |
+          curl -s -o /dev/null -X POST \
+            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/setMyCommands" \
+            --data-urlencode 'commands=[{"command":"bcs","description":"latest BCS results"},{"command":"all","description":"latest ALL PSC items"},{"command":"latest","description":"latest BCS results"},{"command":"epaper","description":"today's HD e-papers"},{"command":"status","description":"watcher state"},{"command":"check","description":"run a check now"},{"command":"test","description":"confirm channel is live"},{"command":"help","description":"all commands"}]'
+
       - name: save state
         if: always()
         run: |
