@@ -558,7 +558,7 @@ def send_epapers(chat):
     try:
         import epaper
         send("Fetching today's e-papers...", chat)
-        sent, total, missing = epaper.run(chat=chat, force=True, retries=6, wait=60)
+        sent, total, missing = epaper.run(chat=chat, force=True, retries=2, wait=60)
         if not sent:
             send(
                 f"E-paper fetch failed ({total} pages found). "
