@@ -194,7 +194,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
 
     if not force and st.get("last") == date_str and not os.environ.get("EPAPER_RESEND"):
         print(f"already sent for {date_str}, skipping")
-        return 0, 0, []
+        return -1, 0, []
 
     pages, missing = [], []
     for attempt in range(max(1, retries)):
@@ -244,6 +244,8 @@ def main():
     sent, total, missing = run(date_str=date_str, retries=retries)
     if missing:
         print("missing:", "; ".join(missing))
+    if sent == -1:
+        return 0
     return 0 if sent else 1
 
 
