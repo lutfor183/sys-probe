@@ -541,6 +541,39 @@ def load_updates():
         return []
 
 
+HELP_TEXT = (
+    "Commands:\n"
+    "/bcs - latest BCS results\n"
+    "/all - latest ALL PSC items\n"
+    "/latest - latest BCS results\n"
+    "/epaper - today's HD e-papers (Prothom Alo + Daily Star)\n"
+    "/status - watcher state\n"
+    "/check - run a check now\n"
+    "/test - confirm the channel is live\n"
+    "/help - this list"
+)
+
+
+def send_epapers(chat):
+    try:
+        import epaper
+        send("Fetching today's e-papers...", chat)
+        sent, total, missing = epaper.run(chat=chat, force=True, retries=6, wait=60)
+        if not sent:
+            send(
+                f"E-paper fetch failed ({total} pages found). "
+                f"Missing: {', '.join(missing)[:300] or 'all'}",
+                chat,
+            )
+        elif missing:
+            send(
+                f"Sent {sent}/{total} pages. Missing: {', '.join(missing)[:300]}",
+                chat,
+            )
+    except Exception as e:
+        send(f"E-paper error: {str(e)[:200]}", chat)
+
+
 def answer_commands(ctx):
     global ST
 
@@ -568,7 +601,7 @@ def answer_commands(ctx):
         # auto-subscribe even on plain hi, reply once
         if not raw_text.startswith("/"):
             send(
-                "Subscribed to BCS alerts. Commands: /bcs /all /latest /status /check /test",
+                "Subscribed to alerts.\n\n" + HELP_TEXT,
                 chat,
             )
             continue
@@ -583,6 +616,7 @@ def answer_commands(ctx):
             "/all",
             "/check",
             "/test",
+            "/epaper",
             "/help",
         ):
             if full.startswith(cmd) and len(cmd) >= 3:
@@ -590,10 +624,7 @@ def answer_commands(ctx):
                 break
 
         if cmd == "/start":
-            send(
-                "Subscribed to BCS alerts.\nCommands:\n/bcs - latest BCS\n/all - latest ALL PSC\n/latest - latest BCS\n/status /check /test",
-                chat,
-            )
+            send("Subscribed to alerts.\n\n" + HELP_TEXT, chat)
 
         elif cmd == "/status":
             stamp = ctx.get("stamp", "")
@@ -649,8 +680,14 @@ def answer_commands(ctx):
         elif cmd == "/test":
             send("Probe test: channel live.", chat)
 
+        elif cmd == "/epaper":
+            send_epapers(chat)
+
+        elif cmd == "/help":
+            send(HELP_TEXT, chat)
+
         else:
-            send("Commands: /bcs /all /latest /status /check /test", chat)
+            send(HELP_TEXT, chat)
 
 
 def run_url():

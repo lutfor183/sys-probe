@@ -1,0 +1,52 @@
+name: daily epaper
+
+on:
+  schedule:
+    # 00:00 UTC = 06:00 Asia/Dhaka
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [epaper]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epaper-single
+  cancel-in-progress: false
+
+jobs:
+  epaper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 6 tries x 5 min: the dailies sometimes upload after 06:00.
+      - run: python3 sys-probe/epaper.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          EPAPER_RETRIES: "6"
+
+      - name: save state
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -f sys-probe/epaper_state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "epaper state update"
+          git fetch origin
+          git rebase origin/main || (git rebase --abort; git reset --hard origin/main)
+          git push
+
+      - name: alert on failure
+        if: failure()
+        run: |
+          curl -s -o /dev/null -X POST \
+            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TG_CHAT }}" \
+            --data-urlencode "text=E-paper job failed. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
