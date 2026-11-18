@@ -209,34 +209,52 @@ def page_links(cfg, page, w, h):
     return out
 
 
-def build_pdf(items, path, target_w=595.0, quality=80):
+LADDER = [
+    (1600, 85),
+    (1500, 84),
+    (1400, 84),
+    (1350, 83),
+    (1300, 82),
+    (1250, 82),
+    (1200, 83),
+    (1100, 85),
+    (1000, 88),
+]
+
+
+def encode_page(it, width, quality):
+    """Downscale (halftone noise is thrown away), sharpen, baseline JPEG."""
+    from PIL import Image, ImageFilter
+
+    im = Image.open(io.BytesIO(it["blob"]))
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    w0, h0 = im.size
+    if width and w0 > width:
+        im = im.resize((width, max(1, round(h0 * width / w0))), Image.LANCZOS)
+        im = im.filter(ImageFilter.UnsharpMask(radius=1.2, percent=85, threshold=2))
+    buf = io.BytesIO()
+    im.save(
+        buf, "JPEG", quality=quality, optimize=True, subsampling=2, progressive=False
+    )
+    return buf.getvalue()
+
+
+def build_pdf(items, path, target_w=595.0):
     from reportlab import rl_config
 
     # Binary DCTDecode streams: ASCII85 wrapping inflated every page by 25%.
     rl_config.useA85 = 0
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
-    from PIL import Image
 
     c = canvas.Canvas(path)
     c.setTitle("E-papers")
     for it in items:
-        im = Image.open(io.BytesIO(it["blob"]))
-        w, h = im.size
+        w, h = it["size"]
         s = target_w / float(w)
-        blob = it["blob"]
-        if im.mode != "RGB" or im.info.get("progressive"):
-            buf = io.BytesIO()
-            im.convert("RGB").save(
-                buf,
-                "JPEG",
-                quality=quality,
-                optimize=True,
-                subsampling=2,
-                progressive=False,
-            )
-            blob = buf.getvalue()
         c.setPageSize((w * s, h * s))
+        blob = it.get("enc") or it["blob"]
         c.drawImage(ImageReader(io.BytesIO(blob)), 0, 0, w * s, h * s)
         for x0, y0, x1, y1, url in it["links"]:
             c.linkURL(
@@ -334,6 +352,7 @@ def collect(date_str):
 
 def run(date_str=None, chat=None, force=False, retries=1, wait=300):
     from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
 
     date_str = date_str or today_dhaka()
     st = load_state()
@@ -383,6 +402,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
             built.append(
                 {
                     "n": len(built) + 1,
+                    "size": Image.open(io.BytesIO(blob)).size,
                     "blob": blob,
                     "used": used,
                     "page": it["page"],
@@ -408,12 +428,39 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
             it["links"] = lk
 
     path = os.path.join(HERE, "epapers-" + date_str.replace("/", "-") + ".pdf")
+    budget = int(float(os.environ.get("EPAPER_MAX_MB", "10")) * 1024 * 1024)
+    cache = {}
+
+    def enc_at(i):
+        if i not in cache:
+            w, q = LADDER[i]
+            cache[i] = [(it, encode_page(it, w, q)) for it in built]
+        return cache[i]
+
     try:
+        i = 4  # 1300px is the usual landing spot; probe one step up/down
+        while True:
+            width, q = LADDER[i]
+            enc = enc_at(i)
+            total = sum(len(b) for _, b in enc)
+            print(f"  {width}px q{q}: {total // 1024} KB")
+            if total > budget:
+                if i + 1 >= len(LADDER):
+                    break
+                i += 1
+                continue
+            if i > 0:
+                up = enc_at(i - 1)
+                if sum(len(b) for _, b in up) <= budget:
+                    i -= 1
+                    enc = up
+                    width, q = LADDER[i]
+            break
+        for it, b in enc:
+            it["enc"] = b
+        pick = (width, q)
         build_pdf(built, path)
         size = os.path.getsize(path)
-        if size > 45 * 1024 * 1024:
-            build_pdf(built, path, quality=74)
-            size = os.path.getsize(path)
         blob = open(path, "rb").read()
         os.unlink(path)
     except ImportError as e:
@@ -425,7 +472,8 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
 
     nlinks = sum(len(x["links"]) for x in built)
     cap = (
-        f"E-papers {date_str} - {len(built)} pages, {nlinks} tappable article links.\n"
+        f"E-papers {date_str} - {len(built)} pages at {pick[0]}px, "
+        f"{size // (1024 * 1024)} MB, {nlinks} tappable article links.\n"
         + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
     )
     try:
