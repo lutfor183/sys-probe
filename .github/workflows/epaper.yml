@@ -2,8 +2,9 @@ name: daily epaper
 
 on:
   schedule:
-    # 00:00 UTC = 06:00 Asia/Dhaka
-    - cron: "0 0 * * *"
+    # Backup only: the 10-minute probe sends at 06:00 Asia/Dhaka.
+    # 01:00 UTC = 07:00 Dhaka, so a probe success already saved state.
+    - cron: "0 1 * * *"
   workflow_dispatch:
   repository_dispatch:
     types: [epaper]
@@ -24,6 +25,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: pip install -q reportlab pillow
 
       # 6 tries x 5 min: the dailies sometimes upload after 06:00.
       - run: python3 sys-probe/epaper.py

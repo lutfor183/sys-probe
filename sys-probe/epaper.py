@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Daily HD e-paper fetcher for Prothom Alo + The Daily Star.
+"""Daily HD e-paper -> single linked PDF for Prothom Alo + The Daily Star.
 
-Source: epapers.vercel.app proxies (the upstream APIs are not reachable
-directly). Each page record exposes a stable human title
-(NewsProPageTitle), so pages are selected by title, not by page number.
+Source: epapers.vercel.app proxy endpoints (upstream APIs are not directly
+reachable). Pages are selected by their stable NewsProPageTitle.
 
-HD: Daily Star serves `..._01_mr.jpg`; dropping `_mr` gives the
-2424x3723 master. Prothom Alo's `XHighResolution` is the largest file
-published. Images are sent as documents so Telegram keeps the bytes.
+HD rules verified on the live service:
+  Daily Star   .../<hash>_01_mr.jpg  ->  .../<hash>_01.jpg   (2424x3723)
+  Prothom Alo  .../<8hex><8hex>_01_hr.jpg -> .../<8hex>_01.jpg (2569x4032)
 
-State file (epaper_state.json) stores only the last sent date string.
+Every page record also carries hotspot rectangles. Each rectangle is turned
+into a PDF /Link over the HD page image, pointing at that story's cropped
+article image (filepathstorypic) so a tap opens the readable crop in the
+browser.
 
+State file stores only the last fully-sent date.
 Runtime secrets (env): TG_TOKEN, TG_CHAT.
 """
+import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -25,50 +30,51 @@ STATE = os.path.join(HERE, "epaper_state.json")
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
-VERBOSE = os.environ.get("PROBE_VERBOSE") == "1"
 
 BASE = "https://epapers.vercel.app"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
-# (paper label, edition id, api path, [(slot, [title candidates], page fallback)])
 PAPERS = [
-    (
-        "Prothom Alo",
-        1,
-        "/prothomalo/api/GetAllpages",
-        [
+    {
+        "label": "Prothom Alo",
+        "edition": 1,
+        "pages": "/prothomalo/api/GetAllpages",
+        "api": "/prothomalo/api",
+        "slots": [
             ("front", ["প্রথম পাতা"], "first"),
             ("last", ["শেষ পাতা"], "last"),
             ("international", ["আন্তর্জাতিক"], None),
             ("editorial", ["অভিমত"], None),
             ("opinion", ["মতামত"], None),
         ],
-    ),
-    (
-        "Daily Star",
-        1,
-        "/dailystar/postapi/GetAllpagespost",
-        [
+    },
+    {
+        "label": "Daily Star",
+        "edition": 1,
+        "pages": "/dailystar/postapi/GetAllpagespost",
+        "api": "/dailystar/api",
+        "slots": [
             ("front", ["FRONT"], "first"),
             ("last", ["BACK"], "last"),
             ("international", ["INTERNATIONAL"], None),
             ("editorial", ["EDITORIAL"], None),
             ("opinion", ["OPINION"], None),
         ],
-    ),
-    (
-        "Daily Star Business",
-        7,
-        "/dailystar/postapi/GetAllpagespost",
-        [
+    },
+    {
+        "label": "Daily Star Business",
+        "edition": 7,
+        "pages": "/dailystar/postapi/GetAllpagespost",
+        "api": "/dailystar/api",
+        "slots": [
             ("front", ["BIZFRONT"], "first"),
             ("last", ["BIZBACK"], "last"),
         ],
-    ),
+    },
 ]
 
 
-def get(url, timeout=45, tries=3):
+def get(url, timeout=60, tries=3):
     last = None
     for i in range(tries):
         try:
@@ -82,30 +88,49 @@ def get(url, timeout=45, tries=3):
 
 
 def get_json(url, timeout=45):
-    raw = get(url, timeout)
-    return json.loads(raw.decode("utf-8", "replace"))
+    return json.loads(get(url, timeout).decode("utf-8", "replace"))
 
 
 def norm(s):
-    s = (s or "").upper()
-    s = s.replace("–", "-").replace("—", "-")
+    s = (s or "").upper().replace("–", "-").replace("—", "-")
     return " ".join(s.split())
 
 
-def hd_url(paper, page):
-    """Largest published image for one page record."""
+def today_dhaka():
+    g = time.gmtime(time.time() + 6 * 3600)
+    return f"{g.tm_mday:02d}/{g.tm_mon:02d}/{g.tm_year}"
+
+
+def hd_urls(paper, page):
+    """Best-first HD candidates for one page record."""
     if paper == "Prothom Alo":
-        return page.get("XHighResolution") or page.get("HighResolution")
+        hr = page.get("XHighResolution") or ""
+        out = []
+        m = re.match(r"^(.*/)([0-9a-f]{8})[0-9a-f]{8}_(\d+)_hr\.jpg$", hr)
+        if m:
+            out.append(f"{m.group(1)}{m.group(2)}_{m.group(3)}.jpg")
+        out += [hr, page.get("HighResolution") or ""]
+        return [u for u in out if u]
     mr = page.get("MrImageUrl") or ""
+    out = []
     if mr.endswith("_mr.jpg"):
-        return mr[: -len("_mr.jpg")] + ".jpg"
-    return page.get("HrImageUrlJpg") or mr
+        out.append(mr[: -len("_mr.jpg")] + ".jpg")
+    out.append(mr)
+    return [u for u in out if u]
 
 
-def pages_for(paper, edition_id, api_path, date_str):
-    url = f"{BASE}{api_path}?editionid={edition_id}&editiondate={date_str}"
-    rows = get_json(url)
-    return rows if isinstance(rows, list) else []
+def fetch_best(urls):
+    err = None
+    for u in urls:
+        try:
+            blob = get(u, timeout=120, tries=2)
+            if len(blob) > 50000:
+                return blob, u
+        except Exception as e:
+            err = e
+    if err:
+        raise err
+    raise IOError("no candidate")
 
 
 def pick(pages, candidates, fallback):
@@ -123,34 +148,97 @@ def pick(pages, candidates, fallback):
     return ordered[0] if fallback == "first" else ordered[-1]
 
 
-def collect(date_str):
-    """-> list of dicts: paper, slot, title, page_no, url"""
-    out, missing = [], []
-    for paper, edition_id, api_path, slots in PAPERS:
+def story_pic(api, sid, depth=3):
+    seen = set()
+    while sid and sid not in seen and depth > 0:
+        seen.add(sid)
+        depth -= 1
         try:
-            pages = pages_for(paper, edition_id, api_path, date_str)
-        except Exception as e:
-            missing.append(f"{paper}: api {str(e)[:60]}")
+            d = get_json(f"{BASE}{api}/getstorydetail?Storyid={sid}")
+        except Exception:
+            return None
+        p = (d.get("filepathstorypic") or "").replace("\\", "/")
+        if p.startswith("http"):
+            return p
+        sid = d.get("LinkedStoryId") or 0
+    return None
+
+
+def page_links(cfg, page, w, h):
+    api = cfg["api"]
+    pw = float(page.get("PageWidth") or page.get("pageImageWidth") or w)
+    ph = float(page.get("PageHeight") or page.get("pageImageHeight") or h)
+    sx, sy = w / pw, h / ph
+    try:
+        hs = get_json(f"{BASE}{api}/getingRectangleObject?pageid={page['PageId']}")
+    except Exception:
+        return []
+    out = []
+    for x in hs if isinstance(hs, list) else []:
+        url = None
+        link = x.get("Url") or ""
+        if x.get("HaveLink") and link.startswith("http"):
+            url = link
+        elif x.get("ObjectId"):
+            if x.get("ObjectType") == 2:
+                url = story_pic(api, x["ObjectId"])
+            else:
+                try:
+                    d = get_json(f"{BASE}{api}/getpicturedetail?Pic_id={x['ObjectId']}")
+                    p = (d.get("ImagePath") or "").replace("\\", "/")
+                    url = p if p.startswith("http") else None
+                except Exception:
+                    url = None
+        if not url:
             continue
-        for slot, candidates, fallback in slots:
-            p = pick(pages, candidates, fallback)
-            url = hd_url(paper, p) if p else ""
-            if not p or not url:
-                missing.append(f"{paper}/{slot}")
-                continue
-            out.append(
-                {
-                    "paper": paper,
-                    "slot": slot,
-                    "title": p.get("NewsProPageTitle") or slot,
-                    "page_no": p.get("PageNo"),
-                    "url": url,
-                }
+        try:
+            x0 = float(x["Rect_Left"]) * sx
+            x1 = float(x["Rect_Right"]) * sx
+            y0 = float(x["Rect_Top"]) * sy
+            y1 = float(x["Rect_Bottom"]) * sy
+        except Exception:
+            continue
+        x0, x1 = max(0.0, min(x0, x1)), min(w, max(x0, x1))
+        y0, y1 = max(0.0, min(y0, y1)), min(h, max(y0, y1))
+        if x1 - x0 < 10 or y1 - y0 < 10:
+            continue
+        out.append((x0, y0, x1, y1, url))
+    return out
+
+
+def build_pdf(items, path, target_w=595.0, quality=88):
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    from PIL import Image
+
+    c = canvas.Canvas(path)
+    c.setTitle("E-papers")
+    for it in items:
+        im = Image.open(io.BytesIO(it["blob"]))
+        w, h = im.size
+        s = target_w / float(w)
+        blob = it["blob"]
+        if im.mode != "RGB" or im.info.get("progressive"):
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=quality)
+            blob = buf.getvalue()
+        c.setPageSize((w * s, h * s))
+        c.drawImage(ImageReader(io.BytesIO(blob)), 0, 0, w * s, h * s)
+        for x0, y0, x1, y1, url in it["links"]:
+            c.linkURL(
+                url,
+                (x0 * s, (h - y1) * s, x1 * s, (h - y0) * s),
+                relative=0,
+                thickness=0,
             )
-    return out, missing
+        key = "p%d" % it["n"]
+        c.bookmarkPage(key)
+        c.addOutlineEntry(it["label"], key, level=0)
+        c.showPage()
+    c.save()
 
 
-def send_document(chat, blob, filename, caption):
+def send_document(chat, blob, filename, caption, mime="application/pdf"):
     if not (TG_TOKEN and chat):
         print(f"[DRY-RUN] {filename} ({len(blob) // 1024} KB) {caption}")
         return True
@@ -159,14 +247,14 @@ def send_document(chat, blob, filename, caption):
         f"--{bnd}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n"
         f"--{bnd}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:900]}\r\n"
         f"--{bnd}\r\nContent-Disposition: form-data; name=\"document\"; "
-        f"filename=\"{filename}\"\r\nContent-Type: image/jpeg\r\n\r\n"
+        f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
     ).encode() + blob + f"\r\n--{bnd}--\r\n".encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={bnd}"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=180) as r:
         return r.status == 200
 
 
@@ -186,56 +274,129 @@ def save_state(st):
         print("state save failed:", str(e)[:80])
 
 
+def collect(date_str):
+    items, missing = [], []
+    for cfg in PAPERS:
+        try:
+            rows = get_json(
+                f"{BASE}{cfg['pages']}?editionid={cfg['edition']}&editiondate={date_str}"
+            )
+        except Exception as e:
+            missing.append(f"{cfg['label']}: api {str(e)[:60]}")
+            continue
+        rows = rows if isinstance(rows, list) else []
+        for slot, cands, fallback in cfg["slots"]:
+            p = pick(rows, cands, fallback)
+            if not p or not hd_urls(cfg["label"], p):
+                missing.append(f"{cfg['label']}/{slot}")
+                continue
+            items.append(
+                {
+                    "cfg": cfg,
+                    "slot": slot,
+                    "page": p,
+                    "title": p.get("NewsProPageTitle") or slot,
+                }
+            )
+    return items, missing
+
+
 def run(date_str=None, chat=None, force=False, retries=1, wait=300):
-    """Fetch and send today's pages. Returns (sent, total, missing)."""
-    date_str = date_str or time.strftime("%d/%m/%Y")
+    date_str = date_str or today_dhaka()
     chat = chat or TG_CHAT
     st = load_state()
 
-    if not force and st.get("last") == date_str and not os.environ.get("EPAPER_RESEND"):
+    if not force and st.get("last") == date_str:
         print(f"already sent for {date_str}, skipping")
         return -1, 0, []
 
-    pages, missing = [], []
+    expect = sum(len(c["slots"]) for c in PAPERS)
+    items, missing = [], []
     for attempt in range(max(1, retries)):
-        pages, missing = collect(date_str)
-        expect = sum(len(s[3]) for s in PAPERS)
-        if len(pages) >= expect:
+        items, missing = collect(date_str)
+        if len(items) >= expect:
             missing = []
             break
         if attempt + 1 < retries:
-            print(f"attempt {attempt + 1}: {len(pages)}/{expect} pages, retrying in {wait}s")
+            print(f"attempt {attempt + 1}: {len(items)}/{expect} pages, wait {wait}s")
             time.sleep(wait)
 
-    sent = 0
-    for p in pages:
-        try:
-            blob = get(p["url"], timeout=90, tries=2)
-            name = (
-                p["paper"].replace(" ", "_")
-                + "_"
-                + p["slot"].upper()
-                + "_"
-                + date_str.replace("/", "-")
-                + ".jpg"
-            )
-            cap = f"{p['paper']} - {p['title']} (page {p['page_no']}) - {date_str}"
-            if send_document(chat, blob, name, cap):
-                sent += 1
-            print(f"sent {name} ({len(blob) // 1024} KB)")
-        except Exception as e:
-            missing.append(f"{p['paper']}/{p['slot']} dl {str(e)[:60]}")
+    if len(items) < expect:
+        print(f"incomplete ({len(items)}/{expect}), not sending. missing={missing}")
+        return 0, len(items), missing
 
-    dry = not (TG_TOKEN and chat)
-    if sent and not missing and not dry:
+    built = []
+    for n, it in enumerate(items, 1):
+        try:
+            blob, used = fetch_best(hd_urls(it["cfg"]["label"], it["page"]))
+        except Exception as e:
+            missing.append(f"{it['cfg']['label']}/{it['slot']} {str(e)[:50]}")
+            continue
+        built.append(
+            {
+                "n": n,
+                "blob": blob,
+                "used": used,
+                "page": it["page"],
+                "cfg": it["cfg"],
+                "slot": it["slot"],
+                "title": it["title"],
+                "label": f"{it['cfg']['label']} - {it['title']}",
+            }
+        )
+
+    if len(built) < expect:
+        print(f"downloads incomplete ({len(built)}/{expect}), not sending")
+        return 0, len(built), missing
+
+    for it in built:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(it["blob"]))
+        w, h = im.size
+        it["links"] = page_links(it["cfg"], it["page"], w, h)
+
+    path = os.path.join(
+        HERE, "epapers-" + date_str.replace("/", "-") + ".pdf"
+    )
+    try:
+        build_pdf(built, path)
+        size = os.path.getsize(path)
+        if size > 45 * 1024 * 1024:
+            build_pdf(built, path, quality=80)
+            size = os.path.getsize(path)
+        blob = open(path, "rb").read()
+        os.unlink(path)
+    except ImportError as e:
+        print("pdf libs missing:", str(e)[:120])
+        return 0, len(built), missing + ["reportlab/pillow missing"]
+    except Exception as e:
+        print("pdf build failed:", str(e)[:160])
+        return 0, len(built), missing + ["pdf build failed"]
+
+    nlinks = sum(len(x["links"]) for x in built)
+    cap = (
+        f"E-papers {date_str} - {len(built)} pages, {nlinks} tappable article links.\n"
+        + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
+    )
+    ok = send_document(chat, blob, os.path.basename(path), cap)
+    print(f"pdf {size // 1024} KB, links={nlinks}, sent={ok}")
+
+    if ok and not (not (TG_TOKEN and chat)):
         st["last"] = date_str
         save_state(st)
-    elif sent and not dry:
-        st["last_partial"] = date_str
-        save_state(st)
+    return (1 if ok else 0), len(built), missing
 
-    print(f"epaper: {sent}/{len(pages)} sent, missing={missing}")
-    return sent, len(pages), missing
+
+def maybe_daily():
+    """Called from the 10-minute probe: first run after 06:00 Dhaka wins."""
+    g = time.gmtime(time.time() + 6 * 3600)
+    if g.tm_hour < 6 or g.tm_hour >= 13:
+        return
+    if load_state().get("last") == today_dhaka():
+        return
+    print("daily epaper trigger")
+    run(date_str=today_dhaka(), retries=1)
 
 
 def main():

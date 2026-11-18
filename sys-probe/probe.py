@@ -546,7 +546,7 @@ HELP_TEXT = (
     "/bcs - latest BCS results\n"
     "/all - latest ALL PSC items\n"
     "/latest - latest BCS results\n"
-    "/epaper - today's HD e-papers (Prothom Alo + Daily Star)\n"
+    "/epaper - today's HD e-paper PDF (Prothom Alo + Daily Star)\n"
     "/status - watcher state\n"
     "/check - run a check now\n"
     "/test - confirm the channel is live\n"
@@ -557,7 +557,7 @@ HELP_TEXT = (
 def send_epapers(chat):
     try:
         import epaper
-        send("Fetching today's e-papers...", chat)
+        send("Building today's e-paper PDF (HD + article links)...", chat)
         sent, total, missing = epaper.run(chat=chat, force=True, retries=2, wait=60)
         if not sent:
             send(
@@ -734,6 +734,14 @@ def main():
         )
 
         return
+
+    # Daily e-paper trigger: the 10-minute probe is far more punctual than
+    # cron, so the first run after 06:00 Dhaka sends the PDF.
+    try:
+        import epaper
+        epaper.maybe_daily()
+    except Exception as e:
+        print("epaper auto failed:", str(e)[:120])
 
     degraded = False
 

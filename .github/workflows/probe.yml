@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -q pycryptodome
+      - run: pip install -q pycryptodome reportlab pillow
       # 6 passes ~45-60s apart per run (fetches are parallel inside probe.py).
       # Covers the full 5-min schedule window, so worst-case gap stays ~5 min
       # instead of ~10. GitHub schedule minimum is 5 min + queue — cron alone
@@ -50,7 +50,7 @@ jobs:
       - run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add -f sys-probe/state.json 2>/dev/null || true
+          git add -f sys-probe/state.json sys-probe/epaper_state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "probe state update"
           git fetch origin
           git rebase origin/main || (git rebase --abort; git reset --hard origin/main)
