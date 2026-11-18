@@ -30,6 +30,9 @@ STATE = os.path.join(HERE, "epaper_state.json")
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
+# Dedicated e-paper bot (@hawker0_bot). Falls back to the probe bot.
+EPAPER_TOKEN = os.environ.get("EPAPER_TOKEN", "")
+EPAPER_CHAT = os.environ.get("EPAPER_CHAT", "")
 
 BASE = "https://epapers.vercel.app"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
@@ -206,7 +209,11 @@ def page_links(cfg, page, w, h):
     return out
 
 
-def build_pdf(items, path, target_w=595.0, quality=88):
+def build_pdf(items, path, target_w=595.0, quality=80):
+    from reportlab import rl_config
+
+    # Binary DCTDecode streams: ASCII85 wrapping inflated every page by 25%.
+    rl_config.useA85 = 0
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
     from PIL import Image
@@ -220,7 +227,14 @@ def build_pdf(items, path, target_w=595.0, quality=88):
         blob = it["blob"]
         if im.mode != "RGB" or im.info.get("progressive"):
             buf = io.BytesIO()
-            im.convert("RGB").save(buf, "JPEG", quality=quality)
+            im.convert("RGB").save(
+                buf,
+                "JPEG",
+                quality=quality,
+                optimize=True,
+                subsampling=2,
+                progressive=False,
+            )
             blob = buf.getvalue()
         c.setPageSize((w * s, h * s))
         c.drawImage(ImageReader(io.BytesIO(blob)), 0, 0, w * s, h * s)
@@ -238,8 +252,25 @@ def build_pdf(items, path, target_w=595.0, quality=88):
     c.save()
 
 
-def send_document(chat, blob, filename, caption, mime="application/pdf"):
-    if not (TG_TOKEN and chat):
+def discover_chat(token):
+    """Last chat that talked to this bot, so /start alone binds delivery."""
+    if not token:
+        return ""
+    try:
+        d = get_json(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1&limit=1", 20)
+    except Exception:
+        return ""
+    for u in reversed(d.get("result") or []):
+        for k in ("message", "edited_message", "channel_post"):
+            c = (u.get(k) or {}).get("chat") or {}
+            if c.get("id"):
+                return str(c["id"])
+    return ""
+
+
+def send_document(chat, blob, filename, caption, mime="application/pdf", token=None):
+    token = token or TG_TOKEN
+    if not (token and chat):
         print(f"[DRY-RUN] {filename} ({len(blob) // 1024} KB) {caption}")
         return True
     bnd = "----epaper" + os.urandom(8).hex()
@@ -250,7 +281,7 @@ def send_document(chat, blob, filename, caption, mime="application/pdf"):
         f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
     ).encode() + blob + f"\r\n--{bnd}--\r\n".encode()
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+        f"https://api.telegram.org/bot{token}/sendDocument",
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={bnd}"},
     )
@@ -302,13 +333,25 @@ def collect(date_str):
 
 
 def run(date_str=None, chat=None, force=False, retries=1, wait=300):
+    from concurrent.futures import ThreadPoolExecutor
+
     date_str = date_str or today_dhaka()
-    chat = chat or TG_CHAT
     st = load_state()
 
     if not force and st.get("last") == date_str:
         print(f"already sent for {date_str}, skipping")
         return -1, 0, []
+
+    # An explicit chat means the sys-probe /epaper command: reply with that bot.
+    # Otherwise deliver through the dedicated e-paper bot.
+    if chat:
+        token = TG_TOKEN
+    else:
+        token = EPAPER_TOKEN or TG_TOKEN
+        chat = EPAPER_CHAT or discover_chat(token)
+    if not chat:
+        print("e-paper: no chat yet, send /start to the e-paper bot first")
+        return 0, 0, ["chat"]
 
     expect = sum(len(c["slots"]) for c in PAPERS)
     items, missing = [], []
@@ -325,45 +368,51 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         print(f"incomplete ({len(items)}/{expect}), not sending. missing={missing}")
         return 0, len(items), missing
 
-    built = []
-    for n, it in enumerate(items, 1):
+    def fetch(it):
         try:
-            blob, used = fetch_best(hd_urls(it["cfg"]["label"], it["page"]))
+            return it, fetch_best(hd_urls(it["cfg"]["label"], it["page"]))
         except Exception as e:
-            missing.append(f"{it['cfg']['label']}/{it['slot']} {str(e)[:50]}")
-            continue
-        built.append(
-            {
-                "n": n,
-                "blob": blob,
-                "used": used,
-                "page": it["page"],
-                "cfg": it["cfg"],
-                "slot": it["slot"],
-                "title": it["title"],
-                "label": f"{it['cfg']['label']} - {it['title']}",
-            }
-        )
+            return it, (None, f"{it['cfg']['label']}/{it['slot']} {str(e)[:50]}")
+
+    built = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for it, (blob, used) in ex.map(fetch, items):
+            if blob is None:
+                missing.append(used)
+                continue
+            built.append(
+                {
+                    "n": len(built) + 1,
+                    "blob": blob,
+                    "used": used,
+                    "page": it["page"],
+                    "cfg": it["cfg"],
+                    "slot": it["slot"],
+                    "title": it["title"],
+                    "label": f"{it['cfg']['label']} - {it['title']}",
+                }
+            )
 
     if len(built) < expect:
         print(f"downloads incomplete ({len(built)}/{expect}), not sending")
         return 0, len(built), missing
 
-    for it in built:
+    def links(it):
         from PIL import Image
 
-        im = Image.open(io.BytesIO(it["blob"]))
-        w, h = im.size
-        it["links"] = page_links(it["cfg"], it["page"], w, h)
+        w, h = Image.open(io.BytesIO(it["blob"])).size
+        return page_links(it["cfg"], it["page"], w, h)
 
-    path = os.path.join(
-        HERE, "epapers-" + date_str.replace("/", "-") + ".pdf"
-    )
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for it, lk in zip(built, ex.map(links, built)):
+            it["links"] = lk
+
+    path = os.path.join(HERE, "epapers-" + date_str.replace("/", "-") + ".pdf")
     try:
         build_pdf(built, path)
         size = os.path.getsize(path)
         if size > 45 * 1024 * 1024:
-            build_pdf(built, path, quality=80)
+            build_pdf(built, path, quality=74)
             size = os.path.getsize(path)
         blob = open(path, "rb").read()
         os.unlink(path)
@@ -379,10 +428,14 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         f"E-papers {date_str} - {len(built)} pages, {nlinks} tappable article links.\n"
         + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
     )
-    ok = send_document(chat, blob, os.path.basename(path), cap)
+    try:
+        ok = send_document(chat, blob, os.path.basename(path), cap, token=token)
+    except Exception as e:
+        print("send failed:", str(e)[:140])
+        ok = False
     print(f"pdf {size // 1024} KB, links={nlinks}, sent={ok}")
 
-    if ok and not (not (TG_TOKEN and chat)):
+    if ok:
         st["last"] = date_str
         save_state(st)
     return (1 if ok else 0), len(built), missing
@@ -402,7 +455,8 @@ def maybe_daily():
 def main():
     date_str = sys.argv[1] if len(sys.argv) > 1 else None
     retries = int(os.environ.get("EPAPER_RETRIES", "1"))
-    sent, total, missing = run(date_str=date_str, retries=retries)
+    force = os.environ.get("EPAPER_FORCE") == "1"
+    sent, total, missing = run(date_str=date_str, retries=retries, force=force)
     if missing:
         print("missing:", "; ".join(missing))
     if sent == -1:

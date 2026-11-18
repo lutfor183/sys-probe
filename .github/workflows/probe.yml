@@ -43,6 +43,8 @@ jobs:
           PROBE_KEY: ${{ secrets.PROBE_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
+          EPAPER_TOKEN: ${{ secrets.EPAPER_TOKEN }}
+          EPAPER_CHAT: ${{ secrets.EPAPER_CHAT }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_APP: ${{ secrets.MAIL_APP }}
           MAIL_TO: ${{ secrets.MAIL_TO }}

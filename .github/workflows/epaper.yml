@@ -1,48 +1,45 @@
 name: daily epaper
 
+# No schedule: the 10-minute probe sends at 06:00 Asia/Dhaka.
+# This file is only the manual "send now" button (costs nothing when idle).
 on:
-  schedule:
-    # Backup only: the 10-minute probe sends at 06:00 Asia/Dhaka.
-    # 01:00 UTC = 07:00 Dhaka, so a probe success already saved state.
-    - cron: "0 1 * * *"
   workflow_dispatch:
-  repository_dispatch:
-    types: [epaper]
-
-permissions:
-  contents: write
+    inputs:
+      force:
+        description: "Re-send even if today's PDF was already delivered"
+        type: boolean
+        default: true
+      date:
+        description: "Date DD/MM/YYYY (blank = today, Dhaka)"
+        type: string
+        required: false
 
 concurrency:
   group: epaper-single
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
-  epaper:
+  send:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -q reportlab pillow
-
-      # 6 tries x 5 min: the dailies sometimes upload after 06:00.
-      - run: python3 sys-probe/epaper.py
+      - name: Build and send PDF
         env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT: ${{ secrets.TG_CHAT }}
-          EPAPER_RETRIES: "6"
-
-      - name: register bot command menu
-        if: always()
-        run: |
-          curl -s -o /dev/null -X POST \
-            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/setMyCommands" \
-            --data-urlencode 'commands=[{"command":"bcs","description":"latest BCS results"},{"command":"all","description":"latest ALL PSC items"},{"command":"latest","description":"latest BCS results"},{"command":"epaper","description":"HD e-papers today"},{"command":"status","description":"watcher state"},{"command":"check","description":"run a check now"},{"command":"test","description":"confirm channel is live"},{"command":"help","description":"all commands"}]'
-
-      - name: save state
-        if: always()
+          EPAPER_TOKEN: ${{ secrets.EPAPER_TOKEN }}
+          EPAPER_CHAT: ${{ secrets.EPAPER_CHAT }}
+          EPAPER_FORCE: ${{ inputs.force && '1' || '' }}
+          EPAPER_RETRIES: "4"
+          DATE_ARG: ${{ inputs.date }}
+        run: python3 sys-probe/epaper.py $DATE_ARG
+      - name: Commit state
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
@@ -51,11 +48,3 @@ jobs:
           git fetch origin
           git rebase origin/main || (git rebase --abort; git reset --hard origin/main)
           git push
-
-      - name: alert on failure
-        if: failure()
-        run: |
-          curl -s -o /dev/null -X POST \
-            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TG_CHAT }}" \
-            --data-urlencode "text=E-paper job failed. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
