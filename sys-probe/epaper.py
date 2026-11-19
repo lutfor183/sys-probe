@@ -477,7 +477,11 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
 
     # An explicit chat means the sys-probe /epaper command: reply with that bot.
     # Otherwise deliver through the dedicated e-paper bot.
-    if chat:
+    dry = os.environ.get("EPAPER_DRY") == "1"
+    if dry:
+        token = ""
+        chat = "dry"
+    elif chat:
         token = TG_TOKEN
     else:
         token = EPAPER_TOKEN or TG_TOKEN
@@ -594,7 +598,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
         + (f"\nNo links on: {', '.join(nolink)}" if nolink else "")
     )
-    if os.environ.get("EPAPER_DRY") == "1":
+    if dry:
         print(f"DRY RUN: built {os.path.basename(path)}, {size // 1024} KB, {nlinks} links")
         print(cap)
         return 1, len(built), missing
