@@ -13,6 +13,10 @@ on:
         description: "Date DD/MM/YYYY (blank = today, Dhaka)"
         type: string
         required: false
+      dry_run:
+        description: "Build and log only, do not send (debug page/link coverage)"
+        type: boolean
+        default: false
 
 concurrency:
   group: epaper-single
@@ -37,6 +41,7 @@ jobs:
           EPAPER_CHAT: ${{ secrets.EPAPER_CHAT }}
           EPAPER_FORCE: ${{ inputs.force && '1' || '' }}
           EPAPER_RETRIES: "4"
+          EPAPER_DRY: ${{ inputs.dry_run && '1' || '' }}
           DATE_ARG: ${{ inputs.date }}
         run: python3 sys-probe/epaper.py $DATE_ARG
       - name: Commit state

@@ -594,6 +594,10 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
         + (f"\nNo links on: {', '.join(nolink)}" if nolink else "")
     )
+    if os.environ.get("EPAPER_DRY") == "1":
+        print(f"DRY RUN: built {os.path.basename(path)}, {size // 1024} KB, {nlinks} links")
+        print(cap)
+        return 1, len(built), missing
     try:
         ok = send_document(chat, blob, os.path.basename(path), cap, token=token)
     except Exception as e:
