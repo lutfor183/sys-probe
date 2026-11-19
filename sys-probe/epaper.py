@@ -104,6 +104,50 @@ def today_dhaka():
     return f"{g.tm_mday:02d}/{g.tm_mon:02d}/{g.tm_year}"
 
 
+def _slots_from_env():
+    """EPAPER_SLOTS='{"Prothom Alo": ["প্রথম পাতা", "শেষ পাতা"]}'"""
+    raw = os.environ.get("EPAPER_SLOTS", "").strip()
+    if not raw:
+        return
+    try:
+        want = json.loads(raw)
+    except Exception as e:
+        print(f"EPAPER_SLOTS ignored: {e}")
+        return
+    for cfg in PAPERS:
+        titles = want.get(cfg["label"]) or want.get(cfg["label"].split()[0])
+        if not titles:
+            continue
+        cfg["slots"] = [
+            (re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-") or f"p{i}", [t], None)
+            for i, t in enumerate(titles)
+        ]
+        print(f"{cfg['label']}: {len(titles)} slots from EPAPER_SLOTS")
+
+
+_slots_from_env()
+
+
+def dump_pages(date_str):
+    """EPAPER_DISCOVER=1 prints every page the API offers, for slot tuning."""
+    if os.environ.get("EPAPER_DISCOVER") != "1":
+        return
+    for cfg in PAPERS:
+        try:
+            rows = get_json(
+                f"{BASE}{cfg['pages']}?editionid={cfg['edition']}&editiondate={date_str}"
+            )
+        except Exception as e:
+            print(f"{cfg['label']}: {e}")
+            continue
+        print(f"[{cfg['label']}] {len(rows)} pages")
+        for p in rows:
+            print(
+                f"   ed{p.get('EditionID')} p{p.get('PageNo')} id{p.get('PageId')} "
+                f"{p.get('NewsProPageTitle')!r}"
+            )
+
+
 def hd_urls(paper, page):
     """Best-first HD candidates for one page record."""
     if paper == "Prothom Alo":
@@ -136,19 +180,60 @@ def fetch_best(urls):
     raise IOError("no candidate")
 
 
-def pick(pages, candidates, fallback):
-    titles = [norm(c) for c in candidates]
+def as_int(v, d=0):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+
+def page_no(p):
+    try:
+        return int(p.get("PageNo") or 0)
+    except Exception:
+        return 0
+
+
+def pick(pages, candidates, edition, fallback, used=()):
+    """Match a section by title, preferring this paper's main edition.
+
+    Titles are the only cross-day key the API offers (PageId changes daily),
+    so nothing is pinned to a page number. Ties between two pages carrying the
+    same section name (e.g. an edition-specific duplicate) are settled by
+    EditionID, then by the earlier candidate, then by page order.
+    """
+    best = None
     for p in pages:
-        n = norm(p.get("NewsProPageTitle"))
-        for t in titles:
-            if n and (n == t or n.startswith(t)):
-                return p
+        if p.get("PageId") in used:
+            continue
+        t = norm(p.get("NewsProPageTitle"))
+        if not t:
+            continue
+        for i, c in enumerate(candidates):
+            n = norm(c)
+            if t == n:
+                rank = 3
+            elif t.startswith(n):
+                rank = 2
+            elif n in t:
+                rank = 1
+            else:
+                continue
+            key = (rank, 1 if as_int(p.get("EditionID"), -1) == as_int(edition, -2) else 0, -i, -page_no(p))
+            if best is None or key > best[0]:
+                best = (key, p)
+            break
+    if best is not None:
+        return best[1], False
     if not fallback:
-        return None
-    ordered = sorted(pages, key=lambda p: p.get("PageNo") or 0)
-    if not ordered:
-        return None
-    return ordered[0] if fallback == "first" else ordered[-1]
+        return None, False
+    fresh = sorted(
+        (p for p in pages if p.get("PageId") not in used),
+        key=page_no,
+    )
+    if not fresh:
+        return None, False
+    return (fresh[0] if fallback == "first" else fresh[-1]), True
 
 
 def story_pic(api, sid, depth=3):
@@ -167,17 +252,30 @@ def story_pic(api, sid, depth=3):
     return None
 
 
-def page_links(cfg, page, w, h):
+def page_links(cfg, page, w, h, tries=2):
+    """Hotspot rects -> (x0, y0, x1, y1, url). Retries an empty page."""
+    links = []
+    for attempt in range(tries):
+        links = _page_links_once(cfg, page, w, h)
+        if links:
+            break
+        time.sleep(3)
+    return links
+
+
+def _page_links_once(cfg, page, w, h):
     api = cfg["api"]
     pw = float(page.get("PageWidth") or page.get("pageImageWidth") or w)
     ph = float(page.get("PageHeight") or page.get("pageImageHeight") or h)
     sx, sy = w / pw, h / ph
     try:
         hs = get_json(f"{BASE}{api}/getingRectangleObject?pageid={page['PageId']}")
-    except Exception:
+    except Exception as e:
+        print(f"    hotspots failed: {str(e)[:60]}")
         return []
-    out = []
-    for x in hs if isinstance(hs, list) else []:
+    hs = hs if isinstance(hs, list) else []
+    out, skipped = [], 0
+    for x in hs:
         url = None
         link = x.get("Url") or ""
         if x.get("HaveLink") and link.startswith("http"):
@@ -193,6 +291,7 @@ def page_links(cfg, page, w, h):
                 except Exception:
                     url = None
         if not url:
+            skipped += 1
             continue
         try:
             x0 = float(x["Rect_Left"]) * sx
@@ -200,12 +299,18 @@ def page_links(cfg, page, w, h):
             y0 = float(x["Rect_Top"]) * sy
             y1 = float(x["Rect_Bottom"]) * sy
         except Exception:
+            skipped += 1
             continue
         x0, x1 = max(0.0, min(x0, x1)), min(w, max(x0, x1))
         y0, y1 = max(0.0, min(y0, y1)), min(h, max(y0, y1))
         if x1 - x0 < 10 or y1 - y0 < 10:
+            skipped += 1
             continue
         out.append((x0, y0, x1, y1, url))
+    print(
+        f"    hotspots {len(hs)} -> links {len(out)} "
+        f"(story/pic resolved, skipped {skipped})"
+    )
     return out
 
 
@@ -324,6 +429,7 @@ def save_state(st):
 
 
 def collect(date_str):
+    dump_pages(date_str)
     items, missing = [], []
     for cfg in PAPERS:
         try:
@@ -334,11 +440,19 @@ def collect(date_str):
             missing.append(f"{cfg['label']}: api {str(e)[:60]}")
             continue
         rows = rows if isinstance(rows, list) else []
+        used = set()
         for slot, cands, fallback in cfg["slots"]:
-            p = pick(rows, cands, fallback)
+            p, inferred = pick(rows, cands, cfg["edition"], fallback, used)
             if not p or not hd_urls(cfg["label"], p):
                 missing.append(f"{cfg['label']}/{slot}")
                 continue
+            used.add(p.get("PageId"))
+            note = " (inferred: no title match)" if inferred else ""
+            print(
+                f"  {cfg['label']} {slot}: ed{p.get('EditionID')} "
+                f"p{p.get('PageNo')} id{p.get('PageId')} "
+                f"{p.get('NewsProPageTitle')!r}{note}"
+            )
             items.append(
                 {
                     "cfg": cfg,
@@ -426,6 +540,9 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
     with ThreadPoolExecutor(max_workers=6) as ex:
         for it, lk in zip(built, ex.map(links, built)):
             it["links"] = lk
+    nolink = [f"{it['cfg']['label']}/{it['slot']}" for it in built if not it["links"]]
+    if nolink:
+        print("pages without links:", ", ".join(nolink))
 
     path = os.path.join(HERE, "epapers-" + date_str.replace("/", "-") + ".pdf")
     budget = int(float(os.environ.get("EPAPER_MAX_MB", "10")) * 1024 * 1024)
@@ -475,6 +592,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         f"E-papers {date_str} - {len(built)} pages at {pick[0]}px, "
         f"{size // (1024 * 1024)} MB, {nlinks} tappable article links.\n"
         + ", ".join(f"{c['label']} x{len(c['slots'])}" for c in PAPERS)
+        + (f"\nNo links on: {', '.join(nolink)}" if nolink else "")
     )
     try:
         ok = send_document(chat, blob, os.path.basename(path), cap, token=token)
