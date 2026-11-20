@@ -25,6 +25,11 @@ import time
 import urllib.parse
 import urllib.request
 
+try:
+    import epaper_bot as EB
+except Exception:
+    EB = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "epaper_state.json")
 
@@ -464,7 +469,24 @@ def collect(date_str):
     return items, missing
 
 
-def run(date_str=None, chat=None, force=False, retries=1, wait=300):
+def _pending(db, date_str, cap):
+    """Subscribers still owed today's PDF, in join order."""
+    out = []
+    if not (db and EB):
+        return out
+    for cid in EB.subscribers(db):
+        u = (db.get("users") or {}).get(cid) or {}
+        if u.get("last_sent") == date_str:
+            continue
+        if u.get("last_fail") == date_str and int(u.get("fails") or 0) >= 3:
+            continue
+        out.append(cid)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def run(date_str=None, chat=None, force=False, retries=1, wait=300, token=None):
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
 
@@ -479,30 +501,37 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
     # Otherwise deliver through the dedicated e-paper bot.
     dry = os.environ.get("EPAPER_DRY") == "1"
     if dry:
-        token = ""
-        chat = "dry"
+        token, chat = "", "dry"
     elif chat:
-        token = TG_TOKEN
+        token = token or TG_TOKEN
     else:
-        token = EPAPER_TOKEN or TG_TOKEN
+        token = token or EPAPER_TOKEN or TG_TOKEN
+    db = None
+    if not dry and chat is None and EB:
+        db = EB.load()
+        EB.publish_commands(token)
+        if not EB.subscribers(db) and EPAPER_CHAT:
+            chat = EPAPER_CHAT
+    if not dry and chat is None and not (db and EB.subscribers(db)):
         chat = EPAPER_CHAT or discover_chat(token)
-    if not chat:
-        print("e-paper: no chat yet, send /start to the e-paper bot first")
-        return 0, 0, ["chat"]
+        if not chat:
+            print("e-paper: no subscribers yet, send /start to the e-paper bot")
+            return 0, 0, ["chat"]
 
     expect = sum(len(c["slots"]) for c in PAPERS)
+    need = int(os.environ.get("EPAPER_MIN_PAGES", "0") or 0) or expect
     items, missing = [], []
     for attempt in range(max(1, retries)):
         items, missing = collect(date_str)
-        if len(items) >= expect:
+        if len(items) >= need:
             missing = []
             break
         if attempt + 1 < retries:
             print(f"attempt {attempt + 1}: {len(items)}/{expect} pages, wait {wait}s")
             time.sleep(wait)
 
-    if len(items) < expect:
-        print(f"incomplete ({len(items)}/{expect}), not sending. missing={missing}")
+    if len(items) < need:
+        print(f"incomplete ({len(items)}/{need} needed), not sending. missing={missing}")
         return 0, len(items), missing
 
     def fetch(it):
@@ -531,8 +560,8 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
                 }
             )
 
-    if len(built) < expect:
-        print(f"downloads incomplete ({len(built)}/{expect}), not sending")
+    if len(built) < need:
+        print(f"downloads incomplete ({len(built)}/{need} needed), not sending")
         return 0, len(built), missing
 
     def links(it):
@@ -602,28 +631,103 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300):
         print(f"DRY RUN: built {os.path.basename(path)}, {size // 1024} KB, {nlinks} links")
         print(cap)
         return 1, len(built), missing
-    try:
-        ok = send_document(chat, blob, os.path.basename(path), cap, token=token)
-    except Exception as e:
-        print("send failed:", str(e)[:140])
-        ok = False
-    print(f"pdf {size // 1024} KB, links={nlinks}, sent={ok}")
 
-    if ok:
+    sent_ok, failed = 0, 0
+    if chat:
+        try:
+            sent_ok += 1 if send_document(chat, blob, os.path.basename(path), cap, token=token) else 0
+        except Exception as e:
+            print("send failed:", str(e)[:140])
+            failed += 1
+    else:
+        batch = int(os.environ.get("EPAPER_MAX_SEND", "15") or 15)
+        gap = float(os.environ.get("EPAPER_SEND_GAP", "2.5"))
+        targets = _pending(db, date_str, batch)
+        print(f"broadcast: {len(EB.subscribers(db))} subscribers, {len(targets)} this run")
+        for cid in targets:
+            u = db["users"].setdefault(cid, {})
+            try:
+                ok = send_document(cid, blob, os.path.basename(path), cap, token=token)
+            except Exception as e:
+                ok = False
+                print(f"  {cid}: {str(e)[:90]}")
+            if ok:
+                u["last_sent"] = date_str
+                sent_ok += 1
+                EB.bump(db, "pdf_sent")
+            else:
+                u["last_fail"] = date_str
+                u["fails"] = int(u.get("fails") or 0) + 1
+                failed += 1
+            EB.save(db)
+            time.sleep(gap)
+        db.setdefault("totals", {})["last_broadcast"] = {
+            "date": date_str,
+            "sent": sent_ok,
+            "failed": failed,
+        }
+        EB.save(db)
+    print(f"pdf {size // 1024} KB, links={nlinks}, sent={sent_ok}, failed={failed}")
+
+    if sent_ok and not chat and not _pending(db, date_str, 1):
         st["last"] = date_str
+        st["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        st["pages"] = len(built)
         save_state(st)
-    return (1 if ok else 0), len(built), missing
+    return (1 if sent_ok else 0), len(built), missing
+
+
+def status_text():
+    st = load_state()
+    try:
+        db = EB.load() if EB else {}
+    except Exception:
+        db = {}
+    subs = len(EB.subscribers(db)) if (EB and db) else 0
+    return (
+        f"last send: {st.get('last') or 'never'}"
+        + (f" at {st.get('sent_at')}" if st.get("sent_at") else "")
+        + f"\npages {st.get('pages') or '?'}, subscribers {subs}"
+    )
+
+
+def tick():
+    """Answer bot commands; safe to call on every probe run."""
+    if not EB:
+        return
+    token = EPAPER_TOKEN or TG_TOKEN
+    if not token:
+        return
+    db = EB.load()
+    ctx = {
+        "status": status_text(),
+        "epaper_now": lambda cid: run(date_str=today_dhaka(), chat=cid, force=True, token=token),
+    }
+    try:
+        EB.poll(token, db, ctx)
+    finally:
+        EB.save(db)
 
 
 def maybe_daily():
     """Called from the 10-minute probe: first run after 06:00 Dhaka wins."""
+    try:
+        tick()
+    except Exception as e:
+        print("epaper bot tick failed:", str(e)[:120])
+
     g = time.gmtime(time.time() + 6 * 3600)
     if g.tm_hour < 6 or g.tm_hour >= 13:
         return
-    if load_state().get("last") == today_dhaka():
-        return
+
+    date_str = today_dhaka()
+    if load_state().get("last") == date_str:
+        if not (EB and _pending(EB.load(), date_str, 1)):
+            return
+        if g.tm_min % 10 > 1:
+            return
     print("daily epaper trigger")
-    run(date_str=today_dhaka(), retries=1)
+    run(date_str=date_str, retries=1)
 
 
 def main():

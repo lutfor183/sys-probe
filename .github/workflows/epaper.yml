@@ -3,6 +3,11 @@ name: daily epaper
 # No schedule: the 10-minute probe sends at 06:00 Asia/Dhaka.
 # This file is only the manual "send now" button (costs nothing when idle).
 on:
+  schedule:
+    # Best effort 00:00 UTC = 06:00 Asia/Dhaka. GitHub cron can drift, so the
+    # probe also sends; a cron-job.org / Cloudflare Worker hitting the
+    # dispatch API at 00:00 UTC is the only way to be minute-accurate.
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -41,6 +46,9 @@ jobs:
           EPAPER_CHAT: ${{ secrets.EPAPER_CHAT }}
           EPAPER_FORCE: ${{ inputs.force && '1' || '' }}
           EPAPER_RETRIES: "4"
+          EPAPER_MIN_PAGES: "8"
+          EPAPER_MAX_SEND: "15"
+          EPAPER_SEND_GAP: "2.5"
           EPAPER_DRY: ${{ inputs.dry_run && '1' || '' }}
           DATE_ARG: ${{ inputs.date }}
         run: python3 sys-probe/epaper.py $DATE_ARG
@@ -49,6 +57,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add -f sys-probe/epaper_state.json 2>/dev/null || true
+          if [ -n "${{ secrets.PROBE_KEY }}" ]; then git add -f sys-probe/epaper_users.enc.json 2>/dev/null || true; fi
           git diff --cached --quiet || git commit -m "epaper state update"
           git fetch origin
           git rebase origin/main || (git rebase --abort; git reset --hard origin/main)

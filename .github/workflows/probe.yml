@@ -45,6 +45,9 @@ jobs:
           TG_CHAT: ${{ secrets.TG_CHAT }}
           EPAPER_TOKEN: ${{ secrets.EPAPER_TOKEN }}
           EPAPER_CHAT: ${{ secrets.EPAPER_CHAT }}
+          EPAPER_MIN_PAGES: "8"
+          EPAPER_MAX_SEND: "15"
+          EPAPER_SEND_GAP: "2.5"
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_APP: ${{ secrets.MAIL_APP }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
@@ -53,6 +56,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add -f sys-probe/state.json sys-probe/epaper_state.json 2>/dev/null || true
+          if [ -n "${{ secrets.PROBE_KEY }}" ]; then git add -f sys-probe/epaper_users.enc.json 2>/dev/null || true; fi
           git diff --cached --quiet || git commit -m "probe state update"
           git fetch origin
           git rebase origin/main || (git rebase --abort; git reset --hard origin/main)
