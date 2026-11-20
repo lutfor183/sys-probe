@@ -499,6 +499,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300, token=None):
 
     # An explicit chat means the sys-probe /epaper command: reply with that bot.
     # Otherwise deliver through the dedicated e-paper bot.
+    explicit = chat is not None
     dry = os.environ.get("EPAPER_DRY") == "1"
     if dry:
         token, chat = "", "dry"
@@ -517,6 +518,12 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300, token=None):
         if not chat:
             print("e-paper: no subscribers yet, send /start to the e-paper bot")
             return 0, 0, ["chat"]
+        if db is not None:
+            u = db["users"].setdefault(
+                str(chat),
+                {"sub": True, "joined": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            )
+            u["sub"] = True
 
     expect = sum(len(c["slots"]) for c in PAPERS)
     need = int(os.environ.get("EPAPER_MIN_PAGES", "0") or 0) or expect
@@ -639,6 +646,12 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300, token=None):
         except Exception as e:
             print("send failed:", str(e)[:140])
             failed += 1
+        if db is not None and sent_ok:
+            (db["users"].setdefault(str(chat), {}))["last_sent"] = date_str
+            try:
+                EB.save(db)
+            except Exception:
+                pass
     else:
         batch = int(os.environ.get("EPAPER_MAX_SEND", "15") or 15)
         gap = float(os.environ.get("EPAPER_SEND_GAP", "2.5"))
@@ -669,7 +682,7 @@ def run(date_str=None, chat=None, force=False, retries=1, wait=300, token=None):
         EB.save(db)
     print(f"pdf {size // 1024} KB, links={nlinks}, sent={sent_ok}, failed={failed}")
 
-    if sent_ok and not chat and not _pending(db, date_str, 1):
+    if sent_ok and not explicit and not _pending(db, date_str, 1):
         st["last"] = date_str
         st["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         st["pages"] = len(built)
